@@ -5,12 +5,12 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use remnanode_rust::{
-    api::{AppState, router},
+    api::{AppState, internal_router, router},
     auth::{Auth, derive_sni},
     config::Config,
     core::Core,
 };
-use std::{sync::Arc, time::Duration};
+use std::{future::IntoFuture, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Semaphore, time::timeout};
 use tokio_rustls::LazyConfigAcceptor;
 
@@ -32,11 +32,11 @@ async fn main() -> Result<()> {
     let mut tls = config.payload.tls_config()?;
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let tls = Arc::new(tls);
-    let state = AppState::new(
-        Core::new(config.xray_binary, config.state_dir, config.endpoint),
-        Auth::new(&config.payload.jwt_public_key)?,
-    );
+    let core = Core::new(config.xray_binary, config.state_dir, config.endpoint);
+    let internal = core.bind_webhook()?;
+    let state = AppState::new(core, Auth::new(&config.payload.jwt_public_key)?);
     let app = router(state.clone());
+    tokio::spawn(axum::serve(internal, internal_router(state.clone())).into_future());
     let listener = TcpListener::bind(("0.0.0.0", config.port))
         .await
         .context("Cannot bind NODE_PORT")?;

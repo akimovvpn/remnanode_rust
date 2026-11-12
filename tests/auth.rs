@@ -33,6 +33,15 @@ fn secret_payload_rejects_missing_fields_and_invalid_certificates() {
     assert!(NodePayload::decode(&STANDARD.encode("{}")).is_err());
 }
 #[test]
+fn quoted_compose_secret_decodes_like_upstream() {
+    // `- SECRET_KEY="..."` in compose keeps the quotes; Node's base64 decoder skips them.
+    let error = NodePayload::decode(&format!("\"{}\"\n", STANDARD.encode("{}")))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("certificate payload"), "{error}");
+}
+#[test]
 fn invalid_rsa_key_rejected_at_startup() {
     assert!(Auth::new("not-a-pem").is_err());
 }

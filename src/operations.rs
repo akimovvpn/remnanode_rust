@@ -59,6 +59,7 @@ mod tests {
 use crate::{core::Core, grpc::*};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use ipnet::IpNet;
 use prost::Message;
 use serde_json::{Value, json};
 use std::{
@@ -366,7 +367,7 @@ async fn users_ips(grpc: &mut Grpc) -> Result<Value> {
         Err(e) => Err(e),
     }
 }
-fn automatic_drop_available() -> bool {
+pub(crate) fn automatic_drop_available() -> bool {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/self/status")
@@ -384,14 +385,17 @@ fn automatic_drop_available() -> bool {
         false
     }
 }
-fn drop_targets(ips: Vec<String>, whitelist: &HashSet<IpAddr>) -> Result<HashSet<IpAddr>> {
+fn drop_targets(ips: Vec<String>, whitelist: &[IpNet]) -> Result<HashSet<IpAddr>> {
     let ips = ips
         .iter()
         .map(|ip| ip.parse::<IpAddr>().context("invalid IP address"))
         .collect::<Result<HashSet<_>>>()?;
-    Ok(ips.difference(whitelist).copied().collect())
+    Ok(ips
+        .into_iter()
+        .filter(|ip| !crate::plugins::listed(whitelist, *ip))
+        .collect())
 }
-async fn drop_ips(ips: Vec<String>, whitelist: &HashSet<IpAddr>) -> Result<()> {
+pub(crate) async fn drop_ips(ips: Vec<String>, whitelist: &[IpNet]) -> Result<()> {
     let ips = drop_targets(ips, whitelist)?;
     ensure!(
         cfg!(target_os = "linux"),
@@ -486,14 +490,14 @@ async fn geocheck(body: &Value) -> Result<Value> {
 }
 
 pub async fn handle(path: &str, body: &Value, core: &mut Core) -> Result<Value> {
-    handle_with_whitelist(path, body, core, &HashSet::new()).await
+    handle_with_whitelist(path, body, core, &[]).await
 }
 
 pub async fn handle_with_whitelist(
     path: &str,
     body: &Value,
     core: &mut Core,
-    whitelist: &HashSet<IpAddr>,
+    whitelist: &[IpNet],
 ) -> Result<Value> {
     if path == "/node/stats/get-geocheck" {
         return geocheck(body).await;
@@ -707,14 +711,19 @@ mod more_tests {
     }
     #[test]
     fn validates_all_drop_targets_and_preserves_whitelist() {
-        let whitelist = HashSet::from(["127.0.0.1".parse().unwrap()]);
+        let whitelist = ["192.0.2.0/24".parse().unwrap()];
         assert_eq!(
             drop_targets(
-                vec!["127.0.0.1".into(), "::1".into(), "::1".into()],
+                vec![
+                    "192.0.2.9".into(),
+                    "::1".into(),
+                    "2001:db8::1".into(),
+                    "2001:db8::1".into()
+                ],
                 &whitelist
             )
             .unwrap(),
-            HashSet::from(["::1".parse().unwrap()])
+            HashSet::from(["2001:db8::1".parse().unwrap()])
         );
         assert!(
             drop_targets(

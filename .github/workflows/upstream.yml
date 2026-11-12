@@ -130,6 +130,8 @@ jobs:
           XRAY_BINARY: /tmp/xray/xray
         run: cargo test --locked -- --include-ignored
       - run: python3 scripts/smoke.py --binary target/debug/remnanode-rust --xray /tmp/xray/xray
+      - name: Real nftables tests
+        run: docker run --rm --cap-add NET_ADMIN -v "$PWD":/src:ro -e CARGO_TARGET_DIR=/tmp/t -e NFT_TESTS=1 -w /src rust:1-slim-trixie sh -c 'apt-get update -qq && apt-get install -y -qq nftables && cargo test --locked --lib real_nftables'
       - run: docker build -t remnanode-rust:upstream .
   publish:
     needs: [check, validate]

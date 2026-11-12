@@ -10,6 +10,8 @@ FROM debian:trixie-slim AS assets
 ARG TARGETARCH
 ARG XRAY_VERSION=v26.11.9
 ARG GEOCHECK_VERSION=0.3.0
+# Same rolling source as upstream's ASN_LMDB_URL; the JSON is the data the LMDB is built from.
+ARG ASN_JSON_URL=https://github.com/remnawave/asn-index/releases/latest/download/asn-prefixes.json
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip && rm -rf /var/lib/apt/lists/*
 COPY scripts/verify_xray.py /tmp/verify_xray.py
 RUN apt-get update && apt-get install -y --no-install-recommends python3-minimal && rm -rf /var/lib/apt/lists/*
@@ -24,7 +26,9 @@ RUN case "$TARGETARCH" in amd64) archive=Xray-linux-64.zip ;; arm64) archive=Xra
     && cd /tmp && curl -fLsS --retry 3 "$base/$archive" -o "$archive" \
     && curl -fLsS --retry 3 "$base/checksums.txt" -o checksums.txt \
     && python3 -c 'import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); expected=[line.split()[0] for line in pathlib.Path("checksums.txt").read_text().splitlines() if line.split()[-1].lstrip("*")==p.name]; assert len(expected)==1 and hashlib.sha256(p.read_bytes()).hexdigest()==expected[0], "geocheck checksum mismatch"' "$archive" \
-    && tar -xzf "$archive" geocheck
+    && tar -xzf "$archive" geocheck \
+    && curl -fLsS --retry 3 "$ASN_JSON_URL" -o /tmp/asn-prefixes.json \
+    && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert len(d)>1000 and all(set(v)=={"ipv4","ipv6"} for v in d.values()), "bad ASN database"' /tmp/asn-prefixes.json
 
 FROM debian:trixie-slim
 LABEL org.opencontainers.image.source="https://github.com/akimovvpn/remnanode_rust" \
@@ -36,6 +40,7 @@ COPY --from=build /build/target/release/remnanode-rust /usr/local/bin/remnanode-
 COPY --from=assets /tmp/xray/xray /usr/local/bin/xray
 COPY --from=assets /tmp/xray/geoip.dat /tmp/xray/geosite.dat /usr/local/share/xray/
 COPY --from=assets /tmp/geocheck /usr/local/bin/geocheck
+COPY --from=assets /tmp/asn-prefixes.json /usr/local/share/asn/asn-prefixes.json
 ENV XRAY_LOCATION_ASSET=/usr/local/share/xray
 ENV STATE_DIR=/var/lib/remnanode
 STOPSIGNAL SIGTERM

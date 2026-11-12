@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
 use serde::Deserialize;
 use std::{env, io::BufReader, path::PathBuf, sync::Arc};
@@ -38,9 +38,19 @@ pub fn normalize_pem(pem: &str) -> String {
 impl NodePayload {
     pub fn decode(secret: &str) -> Result<Self> {
         ensure!(secret.len() <= 128 * 1024, "SECRET_KEY exceeds size limit");
+        // Like Node's Buffer.from(_, 'base64'): skip quotes/whitespace (compose `- SECRET_KEY="..."`), accept URL-safe chars.
+        let cleaned: String = secret
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "+/-_".contains(*c))
+            .map(|c| match c {
+                '-' => '+',
+                '_' => '/',
+                c => c,
+            })
+            .collect();
         let mut payload: Self = serde_json::from_slice(
-            &STANDARD
-                .decode(secret)
+            &STANDARD_NO_PAD
+                .decode(cleaned)
                 .context("SECRET_KEY must be base64")?,
         )
         .context("SECRET_KEY must contain the panel certificate payload")?;

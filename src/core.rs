@@ -18,7 +18,10 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 
-use crate::{grpc::Grpc, plugins::Plugins};
+use crate::{
+    grpc::Grpc,
+    plugins::{Plugins, TORRENT_OUTBOUND},
+};
 
 const API_TAG: &str = "REMNAWAVE_API";
 const API_INBOUND: &str = "REMNAWAVE_API_INBOUND";
@@ -32,20 +35,55 @@ pub struct Core {
     child: Option<Child>,
     version: Option<String>,
     empty_config_hash: Option<String>,
+    webhook_token: String,
 }
 
 impl Core {
     pub fn new(binary: PathBuf, state_dir: PathBuf, endpoint: String) -> Self {
+        let mut token = [0u8; 24];
+        fs::File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut token))
+            .expect("read /dev/urandom");
         Self {
             endpoint,
             inbounds: HashMap::new(),
             inbound_ciphers: HashMap::new(),
             binary,
-            state_dir,
+            // Xray only treats absolute paths as unix-socket webhook targets.
+            state_dir: std::path::absolute(&state_dir).unwrap_or(state_dir),
             child: None,
             version: None,
             empty_config_hash: None,
+            webhook_token: token.iter().map(|b| format!("{b:02x}")).collect(),
         }
+    }
+
+    /// Private unix socket where Xray posts routing webhooks (torrent blocker).
+    pub fn webhook_socket(&self) -> PathBuf {
+        self.state_dir.join("internal.sock")
+    }
+
+    pub fn webhook_token(&self) -> &str {
+        &self.webhook_token
+    }
+
+    /// Creates the private state directory and binds the webhook socket inside it.
+    pub fn bind_webhook(&self) -> Result<tokio::net::UnixListener> {
+        private_directory(&self.state_dir)?;
+        let socket = self.webhook_socket();
+        match fs::remove_file(&socket) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error)?,
+            _ => {}
+        }
+        tokio::net::UnixListener::bind(&socket).context("bind internal webhook socket")
+    }
+
+    fn webhook_url(&self) -> String {
+        format!(
+            "{}:/internal/webhook?token={}",
+            self.webhook_socket().display(),
+            self.webhook_token
+        )
     }
 
     pub async fn start(&mut self, body: &Value) -> Result<Value> {
@@ -71,15 +109,15 @@ impl Core {
         ensure!(source.is_object(), "xrayConfig must be an object");
         let internals = body.get("internals").context("internals is required")?;
         ensure!(internals.is_object(), "internals must be an object");
-        if let Some(integrations) = internals.get("integrations") {
-            ensure!(
-                integrations.as_object().is_some_and(|v| v.is_empty()),
-                "integrations are unsupported in this Rust release"
-            );
-        }
+        // Upstream 3.4.5 ships no integration modules, so integration configs are accepted and ignored.
+        ensure!(
+            internals.get("integrations").is_none_or(Value::is_object),
+            "internals.integrations must be an object"
+        );
         validate_internals(internals)?;
         validate_geodata(source.get("geodata"))?;
-        let config = api_config(source, &self.endpoint)?;
+        let torrent = plugins.and_then(Plugins::torrent_routing);
+        let config = api_config(source, &self.endpoint, torrent, &self.webhook_url())?;
         let force = internals
             .get("forceRestart")
             .and_then(Value::as_bool)
@@ -354,7 +392,12 @@ impl Core {
     }
 }
 
-fn api_config(config: &Value, endpoint: &str) -> Result<Value> {
+fn api_config(
+    config: &Value,
+    endpoint: &str,
+    torrent: Option<(&[String], u32)>,
+    webhook: &str,
+) -> Result<Value> {
     let url = reqwest::Url::parse(endpoint).context("invalid Xray API endpoint")?;
     let address = url
         .host_str()
@@ -471,10 +514,45 @@ fn api_config(config: &Value, endpoint: &str) -> Result<Value> {
         .cloned()
         .unwrap_or_default();
     rules.retain(|rule| rule["outboundTag"] != API_TAG);
-    rules.insert(
-        0,
-        json!({"type":"field","inboundTag":[API_INBOUND],"outboundTag":API_TAG}),
-    );
+    // Upstream skips its API rule when routing is script-driven.
+    let script = config["routing"]
+        .get("script")
+        .is_some_and(|script| !matches!(script, Value::Null | Value::Bool(false)) && script != "");
+    if !script {
+        rules.insert(
+            0,
+            json!({"type":"field","inboundTag":[API_INBOUND],"outboundTag":API_TAG}),
+        );
+    }
+    if let Some((tags, position)) = torrent {
+        if config.get("outbounds").is_none() {
+            config["outbounds"] = json!([]);
+        }
+        config["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tag":TORRENT_OUTBOUND,"protocol":"blackhole"}));
+        let hook = json!({"url":webhook,"deduplication":5});
+        // Upstream resolveRuleIndex: just after the API rule, or after `position` user rules.
+        let user_rules = rules.len().saturating_sub(1);
+        let index = if position == 0 {
+            1
+        } else {
+            1 + (position as usize).min(user_rules)
+        };
+        rules.insert(
+            index.min(rules.len()),
+            json!({"protocol":["bittorrent"],"outboundTag":TORRENT_OUTBOUND,"webhook":hook}),
+        );
+        for rule in &mut rules {
+            if rule["ruleTag"]
+                .as_str()
+                .is_some_and(|tag| tags.iter().any(|t| t == tag))
+            {
+                rule["webhook"] = hook.clone();
+            }
+        }
+    }
     config["routing"]["rules"] = Value::Array(rules);
     Ok(config)
 }
@@ -975,6 +1053,72 @@ mod tests {
         assert_eq!(core.health().await["xrayInternalStatusCached"], false);
     }
 
+    #[tokio::test]
+    #[ignore = "requires XRAY_BINARY pointing to a real Xray executable"]
+    async fn real_xray_fires_torrent_webhook_to_internal_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let binary = std::env::var_os("XRAY_BINARY").expect("set XRAY_BINARY");
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (endpoint, proxy_port) = (
+            format!("http://{}", api.local_addr().unwrap()),
+            proxy.local_addr().unwrap().port(),
+        );
+        drop((api, proxy));
+        let temp = tempfile::tempdir().unwrap();
+        let mut core = Core::new(binary.into(), temp.path().join("state"), endpoint);
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let capture = axum::Router::new().route(
+            "/internal/webhook",
+            axum::routing::post(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let _ = sender.send((
+                    uri.to_string(),
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                ));
+                async { axum::http::StatusCode::OK }
+            }),
+        );
+        tokio::spawn(axum::serve(core.bind_webhook().unwrap(), capture).into_future());
+        let mut plugins = Plugins::default();
+        crate::plugins::enable_torrent_for_test(&mut plugins, &[], 0);
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let body = json!({"xrayConfig":{
+            "inbounds":[{"tag":"vless","listen":"127.0.0.1","port":proxy_port,"protocol":"vless",
+                "settings":{"clients":[{"id":id,"email":"alice"}],"decryption":"none"},
+                "sniffing":{"enabled":true,"destOverride":["http","tls"]}}],
+            "outbounds":[{"tag":"direct","protocol":"freedom"}]},
+            "internals":{"hashes":{"emptyConfig":"base","inbounds":[]}}});
+        let result = core.start_with_plugins(&body, &plugins).await.unwrap();
+        assert_eq!(result["isStarted"], true, "{result}");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .unwrap();
+        let mut request = vec![0];
+        request.extend_from_slice(uuid::Uuid::parse_str(id).unwrap().as_bytes());
+        request.extend_from_slice(&[0, 1, 0x1a, 0xe1, 1, 127, 0, 0, 1]);
+        request.push(19);
+        request.extend_from_slice(b"BitTorrent protocol");
+        request.extend_from_slice(&[0; 48]);
+        stream.write_all(&request).await.unwrap();
+        let (uri, event) = tokio::time::timeout(Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            uri,
+            format!("/internal/webhook?token={}", core.webhook_token())
+        );
+        assert_eq!(event["email"], "alice");
+        assert_eq!(event["protocol"], "bittorrent");
+        assert_eq!(event["outboundTag"], TORRENT_OUTBOUND);
+        assert!(event["source"].as_str().unwrap().starts_with("127.0.0.1:"));
+        // The blackhole outbound closes the torrent connection instead of proxying it.
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
+        assert!(rest.len() <= 2, "torrent traffic was proxied: {rest:?}");
+        core.stop().await.unwrap();
+    }
+
     #[test]
     fn injects_api_without_losing_user_policy_or_routing() {
         let original = json!({
@@ -983,7 +1127,7 @@ mod tests {
             "policy":{"levels":{"0":{"handshake":7},"2":{"connIdle":30}},"system":{"custom":true}},
             "routing":{"domainStrategy":"IPIfNonMatch", "rules":[{"domain":["example.org"],"outboundTag":"direct"}]}
         });
-        let config = api_config(&original, "http://127.0.0.1:61000").unwrap();
+        let config = api_config(&original, "http://127.0.0.1:61000", None, "").unwrap();
         assert_eq!(config["api"]["tag"], "REMNAWAVE_API");
         assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
         assert_eq!(config["inbounds"][0]["port"], 61000);
@@ -1010,19 +1154,65 @@ mod tests {
             "http://example.org:61000",
             "https://127.0.0.1:61000",
         ] {
-            assert!(api_config(&json!({}), endpoint).is_err());
+            assert!(api_config(&json!({}), endpoint, None, "").is_err());
         }
         assert!(
             api_config(
                 &json!({"inbounds":[{"tag":"REMNAWAVE_API_INBOUND"}]}),
-                "http://127.0.0.1:61000"
+                "http://127.0.0.1:61000",
+                None,
+                ""
             )
             .is_err()
         );
     }
 
+    #[test]
+    fn injects_torrent_blocker_rule_like_upstream() {
+        let original = json!({"routing":{"rules":[
+            {"ruleTag":"a","outboundTag":"direct"},{"ruleTag":"b","outboundTag":"direct"},{"outboundTag":"direct"}
+        ]}});
+        let rules = |position, tags: &[String]| {
+            api_config(
+                &original,
+                "http://127.0.0.1:1",
+                Some((tags, position)),
+                "/s.sock:/internal/webhook?token=t",
+            )
+            .unwrap()["routing"]["rules"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let default = rules(0, &[]);
+        assert_eq!(default[0]["outboundTag"], API_TAG);
+        assert_eq!(default[1]["protocol"], json!(["bittorrent"]));
+        assert_eq!(default[1]["outboundTag"], TORRENT_OUTBOUND);
+        assert_eq!(
+            default[1]["webhook"],
+            json!({"url":"/s.sock:/internal/webhook?token=t","deduplication":5})
+        );
+        assert_eq!(rules(2, &[])[3]["outboundTag"], TORRENT_OUTBOUND);
+        assert_eq!(rules(1000, &[])[4]["outboundTag"], TORRENT_OUTBOUND);
+        let tagged = rules(0, &["b".to_owned()]);
+        assert!(tagged[2].get("webhook").is_none() && tagged[3]["webhook"]["deduplication"] == 5);
+        let config = api_config(&original, "http://127.0.0.1:1", Some((&[], 0)), "x").unwrap();
+        assert_eq!(
+            config["outbounds"],
+            json!([{"tag":TORRENT_OUTBOUND,"protocol":"blackhole"}])
+        );
+        let scripted = api_config(
+            &json!({"routing":{"script":"x","rules":[]}}),
+            "http://127.0.0.1:1",
+            None,
+            "",
+        )
+        .unwrap();
+        assert_eq!(scripted["routing"]["rules"], json!([]));
+    }
+
     #[tokio::test]
-    async fn rejects_integrations_before_running_binary() {
+    async fn accepts_integrations_like_upstream_build() {
         let temp = tempfile::tempdir().unwrap();
         let mut core = Core::new(
             "/does/not/exist".into(),
@@ -1034,7 +1224,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["isStarted"], false);
-        assert!(response["error"].as_str().unwrap().contains("unsupported"));
+        let error = response["error"].as_str().unwrap();
+        assert!(!error.contains("integrations"), "{error}");
         assert_eq!(
             response["nodeInformation"]["version"],
             crate::upstream_version()

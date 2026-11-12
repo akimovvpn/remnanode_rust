@@ -66,7 +66,7 @@ def main():
         unsigned = f'{b64(b"{\"alg\":\"RS256\",\"typ\":\"JWT\"}")}.{b64(json.dumps({"exp": now + 300}).encode())}'
         signature = run("openssl", "dgst", "-sha256", "-sign", str(jwt_key), data=unsigned.encode())
         token = f"Bearer {unsigned}.{b64(signature)}"
-        env = os.environ | {"NODE_PORT":str(node_port), "SECRET_KEY":base64.b64encode(json.dumps(payload).encode()).decode(), "SNI_VERIFICATION":"true", "XRAY_BINARY":xray, "STATE_DIR":str(folder / "state"), "XRAY_API_ENDPOINT":f"http://127.0.0.1:{api_port}"}
+        env = os.environ | {"NODE_PORT":str(node_port), "SECRET_KEY":"\"" + base64.b64encode(json.dumps(payload).encode()).decode() + "\"", "SNI_VERIFICATION":"true", "XRAY_BINARY":xray, "STATE_DIR":str(folder / "state"), "XRAY_API_ENDPOINT":f"http://127.0.0.1:{api_port}"}
         env.pop("DISABLE_HASHED_SET_CHECK", None)
         client = ssl.create_default_context(cafile=str(folder / "ca.pem"))
         client.minimum_version = ssl.TLSVersion.TLSv1_3

@@ -1,14 +1,14 @@
 services:
   remnanode:
-    build: .
-    image: remnanode-rust:local
     container_name: remnanode
     hostname: remnanode
+    image: ghcr.io/akimovvpn/remnanode_rust:latest
     network_mode: host
-    restart: unless-stopped
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     env_file: .env
-    volumes:
-      - ./state:/var/lib/remnanode
-      - /var/log/remnanode:/var/log/xray
-    # Add NET_ADMIN only when enabling firewall or connection-drop features.
-    # cap_add: [NET_ADMIN]

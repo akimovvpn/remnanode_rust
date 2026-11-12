@@ -10,29 +10,40 @@ A Rust rewrite of [Remnawave Node](https://github.com/remnawave/node) — the ma
 - Mutual TLS 1.3 with the panel CA, RS256 JWT on every request, optional SNI verification — all from the panel's `SECRET_KEY`.
 - Starts, restarts and stops Xray; skips the restart when the user-set hashes are unchanged (same hash algorithm as upstream).
 - Adds/removes VLESS, Trojan, Shadowsocks, Shadowsocks 2022 and Hysteria users over Xray's gRPC API; user/inbound/outbound traffic stats, online status, IP lists, connection drops.
-- nftables plugins: ingress/egress filters, IP block/unblock with timeouts, connection-drop whitelist, socket cleanup and post-start webhook.
-- No JavaScript runtime. The config Xray reads is written with `0600` permissions.
+- All node plugins: **torrent blocker** (Xray detects BitTorrent, the node blocks the user's IP in nftables, drops their connections and reports to the panel), ingress/egress filters, IP block/unblock with timeouts, connection-drop whitelist (IPs and CIDR ranges), shared IP and **ASN lists**, socket cleanup and post-start webhook.
+- `internals.integrations` is accepted exactly like the official 3.4.5 image, which ships no integration modules.
+- No JavaScript runtime. The config Xray reads is written with `0600` permissions; Xray reports torrent events over a private unix socket with a random token.
 
-## Not supported (fails loudly, never pretends)
-
-- Torrent blocker plugin — sync is rejected; `collect` returns no reports.
-- ASN shared lists inside plugin rules, CIDR ranges in connection-drop whitelists.
-- Non-empty `internals.integrations` in `/node/xray/start`.
-
-If your panel config uses one of these, keep the official node on that server.
+Firewall plugins and the torrent blocker need Linux, `nft` and `CAP_NET_ADMIN` (the image has `nft`; add `NET_ADMIN` in compose). Without it they are skipped with a warning, as upstream does.
 
 ## Run it
 
-1. In the panel, create the node and copy its `SECRET_KEY`.
-2. On the server:
+It is a drop-in replacement: in the panel's node compose file, change only the image.
 
-```bash
-git clone https://github.com/akimovvpn/remnanode_rust.git && cd remnanode_rust
-cp .env.example .env   # paste SECRET_KEY, set NODE_PORT
-docker compose up -d --build
+```yaml
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: ghcr.io/akimovvpn/remnanode_rust:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY="paste the key from the panel"
 ```
 
-Uncomment `cap_add: [NET_ADMIN]` in `compose.yaml` if you use firewall plugins, IP blocking or connection drops.
+```bash
+docker compose pull && docker compose up -d && docker compose logs -f
+```
+
+The image is built for amd64 and arm64 and is only published after CI passes on `main`. To build it yourself instead, replace `image:` with `build: https://github.com/akimovvpn/remnanode_rust.git#main`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -46,6 +57,7 @@ Uncomment `cap_add: [NET_ADMIN]` in `compose.yaml` if you use firewall plugins, 
 | `NFTABLES_TABLE_NAME` | `remnanode_rust` | nftables table owned by this node |
 | `NFTABLES_LOGGING` | `true` | Log dropped packets |
 | `NFTABLES_ACCEPT_REPLY_TRAFFIC` | `false` | Let reply traffic bypass ingress blocks |
+| `ASN_DB_PATH` | `/usr/local/share/asn/asn-prefixes.json` | ASN prefix database ([asn-index](https://github.com/remnawave/asn-index), bundled in the image) |
 
 ## Automatic upstream updates
 
@@ -70,6 +82,8 @@ cargo test --locked
 python3 -m unittest discover -s scripts/tests
 python3 scripts/fetch_xray.py --output /tmp/xray
 XRAY_BINARY=/tmp/xray/xray cargo test --locked -- --include-ignored
+docker run --rm --cap-add NET_ADMIN -v "$PWD":/src:ro -e CARGO_TARGET_DIR=/tmp/t -e NFT_TESTS=1 -w /src rust:1-slim-trixie \
+  sh -c 'apt-get update -qq && apt-get install -y -qq nftables && cargo test --locked --lib real_nftables'
 cargo build --locked && python3 scripts/smoke.py --binary target/debug/remnanode-rust --xray /tmp/xray/xray
 ```
 

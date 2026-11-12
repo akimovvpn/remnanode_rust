@@ -2,14 +2,14 @@ use crate::{auth::Auth, core::Core, plugins::Plugins};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, OriginalUri, State},
+    extract::{DefaultBodyLimit, OriginalUri, Query, State},
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 use tower_http::decompression::RequestDecompressionLayer;
 
@@ -50,18 +50,53 @@ pub struct Runtime {
 pub struct AppState {
     pub runtime: Arc<Mutex<Runtime>>,
     auth: Arc<Auth>,
+    webhook_token: Arc<str>,
 }
 
 impl AppState {
     pub fn new(core: Core, auth: Auth) -> Self {
+        let webhook_token = core.webhook_token().into();
         Self {
             runtime: Arc::new(Mutex::new(Runtime {
                 core,
                 plugins: Plugins::default(),
             })),
             auth: Arc::new(auth),
+            webhook_token,
         }
     }
+}
+
+/// Unix-socket-only router for Xray's routing webhooks (upstream /internal/webhook).
+pub fn internal_router(state: AppState) -> Router {
+    Router::new()
+        .route("/internal/webhook", post(webhook))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .with_state(state)
+}
+
+async fn webhook(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> StatusCode {
+    if query.get("token").map(String::as_str) != Some(&*state.webhook_token) {
+        return StatusCode::FORBIDDEN;
+    }
+    let Ok(event) = serde_json::from_slice::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    // Answer Xray at once; blocking waits for the runtime lock, like upstream's event bus.
+    tokio::spawn(async move {
+        state
+            .runtime
+            .lock()
+            .await
+            .plugins
+            .torrent_event(event)
+            .await
+    });
+    StatusCode::OK
 }
 
 pub fn router(state: AppState) -> Router {
@@ -163,6 +198,21 @@ async fn dispatch(
             runtime.core.stop().await
         }
         "/node/xray/healthcheck" => Ok(runtime.core.health().await),
+        "/node/plugin/sync" => {
+            let Runtime { core, plugins } = &mut *runtime;
+            match plugins.sync(&body).await {
+                Ok(outcome) => {
+                    if outcome.stop_xray
+                        && let Err(error) = core.stop().await
+                    {
+                        tracing::warn!(%error, "Stopping Xray after plugin sync failed");
+                    }
+                    Ok(json!({"accepted": outcome.accepted}))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        "/node/plugin/torrent-blocker/collect" => Ok(runtime.plugins.collect()),
         _ if path.starts_with("/node/plugin/") => runtime.plugins.handle(path, &body).await,
         _ => {
             let Runtime { core, plugins } = &mut *runtime;
