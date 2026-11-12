@@ -217,7 +217,7 @@ def write_candidate(repo, ref, tag, output, baseline):
     report = [f"# Upstream {baseline['tag']} → {tag}", '', f"Supported commit: `{baseline['commit']}`", f"Candidate commit: `{candidate['commit']}`", '', 'The supported baseline is unchanged until the Rust port passes checks and its PR is reviewed.', '']
     for kind, names in delta.items():
         report += [f'## {kind.title()} ({len(names)})', ''] + [f'- `{name}`' for name in names] + ['']
-    report += ['## Next steps', '', 'Review every changed source, dependency and container definition; port behavior into Rust, add regression tests, and run CI. Configure OPENAI_API_KEY to request an automated port PR. Contract extraction failures need manual parser review; do not silently accept an incomplete inventory.', '']
+    report += ['## Next steps', '', 'Review every changed source, dependency and container definition; port behavior into Rust, add regression tests, and run CI. Configure CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY or OPENAI_API_KEY to request an automated port PR. Contract extraction failures need manual parser review; do not silently accept an incomplete inventory.', '']
     (output / 'report.md').write_text('\n'.join(report))
     (output / 'prompt.md').write_text(prompt(baseline, candidate))
     for name, (_, content) in files.items():

@@ -52,11 +52,16 @@ Uncomment `cap_add: [NET_ADMIN]` in `compose.yaml` if you use firewall plugins, 
 `.github/workflows/upstream.yml` runs daily:
 
 1. Checks the latest Remnawave Node release and compares every source file, dependency and pinned binary against `upstream/manifest.json`. It never runs upstream code. The report is uploaded as an Actions artifact.
-2. If something changed and the `OPENAI_API_KEY` secret is set, a coding agent ports the change to Rust in a sandbox with no write access.
+2. If something changed, Claude ports the change to Rust with a read-only token. If Claude isn't configured or fails (for example, it hits a usage limit), OpenAI Codex takes over.
 3. A clean job validates the patch (only `src/`, `tests/`, `proto/`, `Cargo.*`, `Dockerfile` and docs may change; workflows and update tooling are off limits), then runs fmt, Clippy, all tests, a real Xray smoke test and a Docker build.
 4. Only if everything passes, it opens a **draft PR**. Nothing is merged or deployed automatically — review it.
 
-Setup: add `OPENAI_API_KEY` under *Settings → Secrets and variables → Actions*, and enable *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*. Without the key you still get the daily drift report. Details: [docs/UPDATES.md](docs/UPDATES.md).
+Setup, under *Settings → Secrets and variables → Actions*, add one or both:
+
+- **Claude:** `CLAUDE_CODE_OAUTH_TOKEN` (uses your Claude subscription; create it with `claude setup-token`) or `ANTHROPIC_API_KEY`.
+- **Codex:** `OPENAI_API_KEY` (OpenAI API billing, separate from a ChatGPT plan).
+
+Then enable *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*. With no keys you still get the daily drift report. Details: [docs/UPDATES.md](docs/UPDATES.md).
 
 ## Develop
 
