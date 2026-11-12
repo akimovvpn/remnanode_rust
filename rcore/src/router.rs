@@ -145,7 +145,12 @@ impl Rule {
 
 impl Router {
     pub fn parse(value: &Value, loader: &mut Loader) -> Result<Self> {
-        keys(value, &["domainStrategy", "rules"], "routing")?;
+        // Xray 26.11.9 ignores the retired matcher selector at both routing and rule level.
+        keys(
+            value,
+            &["domainStrategy", "domainMatcher", "rules"],
+            "routing",
+        )?;
         let strategy = match value["domainStrategy"].as_str().unwrap_or("AsIs") {
             "AsIs" | "" => Strategy::AsIs,
             "IPIfNonMatch" => Strategy::IpIfNonMatch,
@@ -163,6 +168,7 @@ impl Router {
                     "ruleTag",
                     "domain",
                     "domains",
+                    "domainMatcher",
                     "ip",
                     "port",
                     "network",
@@ -489,6 +495,51 @@ mod tests {
         assert!(
             Router::parse(
                 &json!({"rules":[{"balancerTag":"x"}]}),
+                &mut Loader::default()
+            )
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn retired_domain_matcher_fields_do_not_change_routing() {
+        for legacy in [
+            json!("hybrid"),
+            json!("linear"),
+            json!("mph"),
+            json!("unknown"),
+            json!(17),
+            Value::Null,
+        ] {
+            let router=Router::parse(&json!({"domainMatcher":legacy,"rules":[
+                {"domainMatcher":legacy,"domain":["domain:example.com"],"outboundTag":"matched"},
+                {"domain":["full:other.test"],"outboundTag":"other"}
+            ]}),&mut Loader::default()).unwrap();
+            assert_eq!(
+                router
+                    .pick(&ctx(Some("www.example.com"), None, ""))
+                    .await
+                    .unwrap()
+                    .outbound,
+                "matched"
+            );
+            assert_eq!(
+                router
+                    .pick(&ctx(Some("other.test"), None, ""))
+                    .await
+                    .unwrap()
+                    .outbound,
+                "other"
+            );
+            assert!(
+                router
+                    .pick(&ctx(Some("example.com.evil.test"), None, ""))
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(
+            Router::parse(
+                &json!({"domainMatcher":"hybrid","unportedFeature":true}),
                 &mut Loader::default()
             )
             .is_err()

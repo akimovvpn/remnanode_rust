@@ -56,9 +56,9 @@ fn config(api: u16, proxy: u16, net: Net) -> Value {
             {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]}},
             {"tag": "BLOCK", "protocol": "blackhole"}
         ],
-        "routing": {"rules": [
+        "routing": {"domainMatcher":"hybrid","rules": [
             {"type": "field", "inboundTag": ["REMNAWAVE_API_INBOUND"], "outboundTag": "REMNAWAVE_API"},
-            {"type": "field", "protocol": ["bittorrent"], "outboundTag": "BLOCK"}
+            {"type": "field", "domainMatcher":"linear", "protocol": ["bittorrent"], "outboundTag": "BLOCK"}
         ]}
     })
 }

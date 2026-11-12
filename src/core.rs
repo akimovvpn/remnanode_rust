@@ -96,6 +96,9 @@ impl Core {
 
     async fn start_response(&mut self, body: &Value, plugins: Option<&Plugins>) -> Result<Value> {
         let result = self.start_inner(body, plugins).await;
+        if let Err(error) = &result {
+            tracing::warn!(binary=%self.binary.display(),endpoint=%self.endpoint,error=%format!("{error:#}"),"Core start failed");
+        }
         Ok(json!({
             "isStarted": result.is_ok(), "version": self.version,
             "error": result.err().map(|e| format!("{e:#}")),
@@ -149,8 +152,8 @@ impl Core {
                 .args(["run", "-config"])
                 .arg(&config_path)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
                 .kill_on_drop(true)
                 .spawn()
                 .context("spawn Xray")?,
@@ -164,6 +167,7 @@ impl Core {
             return Err(error);
         }
         self.version = read_version(&binary).await;
+        tracing::info!(binary=%binary.display(),endpoint=%self.endpoint,pid=?self.child.as_ref().and_then(Child::id),version=?self.version,"Core started and gRPC is ready");
         self.empty_config_hash = internals["hashes"]["emptyConfig"]
             .as_str()
             .map(str::to_owned);

@@ -222,7 +222,7 @@ async fn dispatch(
     match result {
         Ok(value) => Json(json!({"response":value})).into_response(),
         Err(cause) => {
-            tracing::warn!(%path, error = %cause, "Request failed");
+            tracing::warn!(%path, error = %format!("{cause:#}"), "Request failed");
             operation_error(path, &cause)
         }
     }

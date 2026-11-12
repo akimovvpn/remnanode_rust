@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
     let mut tls = config.payload.tls_config()?;
     tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let tls = Arc::new(tls);
+    tracing::info!(binary=%config.xray_binary.display(),endpoint=%config.endpoint,"Core configured; waiting for panel start request");
     let core = Core::new(config.xray_binary, config.state_dir, config.endpoint);
     let internal = core.bind_webhook()?;
     let state = AppState::new(core, Auth::new(&config.payload.jwt_public_key)?);
