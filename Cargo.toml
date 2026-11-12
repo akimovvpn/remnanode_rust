@@ -1,0 +1,37 @@
+[package]
+name = "remnanode-rust"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Rust management service for Remnawave Node"
+repository = "https://github.com/akimovvpn/remnanode_rust"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+hkdf = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+prost = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.37"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tonic = { version = "0.12", features = ["transport"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["decompression-gzip", "decompression-zstd", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1"
+
+[dev-dependencies]
+tempfile = "3"

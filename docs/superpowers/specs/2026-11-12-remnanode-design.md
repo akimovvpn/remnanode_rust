@@ -1,0 +1,5 @@
+# Remnanode Rust
+
+Port remnawave/node release 3.4.5 (4009f09de377cd1011fdfd798d6cc9b690637fb8) to a standalone Rust service. Preserve panel HTTP paths, response envelopes, RS256 JWT and mutual TLS using the existing SECRET_KEY payload. Xray remains the external Go engine; its management service is Rust. Linux containers are the deployment target. Never claim unimplemented plugins work or silently accept unsupported integrations. Protect config and private keys on disk. Test against real Xray where possible.
+
+Use axum/Tokio, rustls, serde, tonic/prost and standard tooling. A single serialized core state prevents concurrent user/start races. Keep runtime free of JavaScript. A scheduled GitHub workflow checks latest upstream releases, generates a source/contract change report, and invokes a coding agent to port changes on a branch. Tests gate the PR; never automatically deploy an arbitrary AI translation. Model API credentials and repository permissions are setup prerequisites, not embedded secrets. Document compatibility gaps and provide deterministic contract drift detection even without AI credentials.
