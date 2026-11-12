@@ -253,13 +253,14 @@ pub fn uuid_string(id: [u8; 16]) -> String {
     )
 }
 
-/// Inbound flow checks for a connection without outer TLS/REALITY (inbound.go Process).
-pub fn check_flow(request: &Request) -> Result<()> {
+/// Inbound flow checks (inbound.go Process). `outer_tls` is true behind TLS 1.3 / REALITY.
+pub fn check_flow(request: &Request, outer_tls: bool) -> Result<()> {
     let account = uuid_string(request.user.id);
     match request.flow.as_str() {
         XRV if request.user.flow == XRV => {
             ensure!(request.command != Command::Udp, "{XRV} doesn't support UDP");
-            bail!("failed to use {XRV}, found outer tls version 0")
+            ensure!(outer_tls, "failed to use {XRV}, found outer tls version 0");
+            Ok(())
         }
         XRV => bail!("account {account} is not able to use the flow {XRV}"),
         "" => {
@@ -324,7 +325,7 @@ mod tests {
             (Command::Tcp, 443, Address::Domain("example.com".into()))
         );
         assert_eq!(rest, b"hello");
-        check_flow(&req).unwrap();
+        check_flow(&req, false).unwrap();
         let mut bad = vec![0];
         bad.extend_from_slice(&[8; 16]);
         let error = read_request(&mut bad.as_slice(), &users)

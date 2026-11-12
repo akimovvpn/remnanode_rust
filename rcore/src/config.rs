@@ -281,6 +281,185 @@ pub struct Inbound {
     pub transport: Transport,
     /// sockopt.trustedXForwardedFor header names.
     pub trusted_xff: Vec<String>,
+    pub reality: Option<std::sync::Arc<crate::reality::Config>>,
+}
+
+/// REALITYConfig.Build (infra/conf/transport_internet.go), server side.
+fn parse_reality(v: &Value, path: &str) -> Result<crate::reality::Config> {
+    keys(
+        v,
+        &[
+            "show",
+            "target",
+            "dest",
+            "type",
+            "xver",
+            "serverNames",
+            "privateKey",
+            "minClientVer",
+            "maxClientVer",
+            "maxTimeDiff",
+            "shortIds",
+            "mldsa65Seed",
+            "limitFallbackUpload",
+            "limitFallbackDownload",
+            "masterKeyLog",
+            // Client-side fields are ignored by a server, as in Xray.
+            "fingerprint",
+            "serverName",
+            "password",
+            "publicKey",
+            "shortId",
+            "mldsa65Verify",
+            "spiderX",
+        ],
+        path,
+    )?;
+    ensure!(
+        v.get("show").is_none_or(|x| x.is_null() || x.is_boolean()),
+        "{path}.show must be a boolean"
+    );
+    for field in ["xver", "maxTimeDiff"] {
+        ensure!(
+            v.get(field)
+                .is_none_or(|x| x.is_null() || x.as_u64().is_some()),
+            "{path}.{field} must be an unsigned integer"
+        );
+    }
+    for field in [
+        "type",
+        "minClientVer",
+        "maxClientVer",
+        "mldsa65Seed",
+        "masterKeyLog",
+    ] {
+        ensure!(
+            v.get(field).is_none_or(|x| x.is_null() || x.is_string()),
+            "{path}.{field} must be a string"
+        );
+    }
+    let dest = match v
+        .get("target")
+        .filter(|t| !t.is_null())
+        .or_else(|| v.get("dest"))
+    {
+        Some(Value::Number(n)) if n.as_u64().is_some_and(|p| p > 0 && p <= 65535) => {
+            format!("localhost:{n}")
+        }
+        Some(Value::String(s)) if s.starts_with('/') || s.starts_with('@') => {
+            return Err(unsupported(&format!("{path}.target unix socket")));
+        }
+        Some(Value::String(s)) if s.parse::<u16>().is_ok() => format!("localhost:{s}"),
+        Some(Value::String(s))
+            if s.rsplit_once(':')
+                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()) =>
+        {
+            s.clone()
+        }
+        _ => bail!("{path}: please fill in a valid value for \"target\""),
+    };
+    ensure!(
+        v["type"]
+            .as_str()
+            .is_none_or(|t| t.is_empty() || t == "tcp"),
+        "{}",
+        unsupported(&format!("{path}.type"))
+    );
+    let xver = v["xver"].as_u64().unwrap_or(0);
+    ensure!(
+        xver <= 2,
+        "{path}: invalid PROXY protocol version, \"xver\" only accepts 0, 1, 2"
+    );
+    ensure!(
+        xver == 0,
+        "{}",
+        unsupported(&format!("{path}.xver (PROXY protocol to the target)"))
+    );
+    let server_names: Vec<String> = string_list(&v["serverNames"], &format!("{path}.serverNames"))?;
+    ensure!(!server_names.is_empty(), "{path}: empty \"serverNames\"");
+    let key = v["privateKey"].as_str().unwrap_or_default();
+    ensure!(!key.is_empty(), "{path}: empty \"privateKey\"");
+    use base64::Engine;
+    let private_key: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key)
+        .ok()
+        .and_then(|k| k.try_into().ok())
+        .with_context(|| format!("{path}: invalid \"privateKey\""))?;
+    let version = |field: &str| -> Result<Option<[u8; 3]>> {
+        let Some(text) = v[field].as_str().filter(|t| !t.is_empty()) else {
+            return Ok(None);
+        };
+        let mut out = [0u8; 3];
+        for (i, part) in text.split('.').enumerate() {
+            ensure!(i < 3, "{path}: invalid \"{field}\": {text}");
+            out[i] = part
+                .parse()
+                .with_context(|| format!("{path}: \"{field}[{i}]\" should be less than 256"))?;
+        }
+        Ok(Some(out))
+    };
+    let short_ids = string_list(&v["shortIds"], &format!("{path}.shortIds"))?;
+    ensure!(
+        !short_ids.is_empty() || v["shortIds"].as_array().is_some_and(|a| !a.is_empty()),
+        "{path}: empty \"shortIds\""
+    );
+    let raw_ids: Vec<String> = match &v["shortIds"] {
+        Value::Array(items) => items
+            .iter()
+            .map(|i| i.as_str().unwrap_or_default().to_owned())
+            .collect(),
+        _ => short_ids,
+    };
+    let mut ids = std::collections::HashSet::new();
+    for (i, id) in raw_ids.iter().enumerate() {
+        ensure!(id.len() <= 16, "{path}: too long \"shortIds[{i}]\": {id}");
+        ensure!(
+            id.len() % 2 == 0 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{path}: invalid \"shortIds[{i}]\": {id}"
+        );
+        let mut out = [0u8; 8];
+        for (j, chunk) in id.as_bytes().chunks(2).enumerate() {
+            out[j] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?;
+        }
+        ids.insert(out);
+    }
+    ensure!(
+        v["mldsa65Seed"].as_str().unwrap_or_default().is_empty(),
+        "{}",
+        unsupported(&format!("{path}.mldsa65Seed"))
+    );
+    ensure!(
+        v["masterKeyLog"].as_str().unwrap_or_default().is_empty(),
+        "{}",
+        unsupported(&format!("{path}.masterKeyLog"))
+    );
+    for limit in ["limitFallbackUpload", "limitFallbackDownload"] {
+        keys(
+            &v[limit],
+            &["afterBytes", "bytesPerSec", "burstBytesPerSec"],
+            &format!("{path}.{limit}"),
+        )?;
+        if let Some(values) = v[limit].as_object() {
+            ensure!(
+                values.values().all(|x| x.as_u64().is_some()),
+                "{path}.{limit} values must be unsigned integers"
+            );
+        }
+        let active = v[limit]
+            .as_object()
+            .is_some_and(|o| o.values().any(|x| x.as_u64().unwrap_or(0) != 0));
+        ensure!(!active, "{}", unsupported(&format!("{path}.{limit}")));
+    }
+    Ok(crate::reality::Config {
+        dest,
+        server_names: server_names.into_iter().collect(),
+        private_key,
+        short_ids: ids,
+        min_client_ver: version("minClientVer")?,
+        max_client_ver: version("maxClientVer")?,
+        max_time_diff: std::time::Duration::from_millis(v["maxTimeDiff"].as_u64().unwrap_or(0)),
+        show: v["show"] == true,
+    })
 }
 
 /// wsSettings / httpupgradeSettings (infra/conf transport_method.go).
@@ -496,6 +675,7 @@ impl Config {
                     "rawSettings",
                     "wsSettings",
                     "httpupgradeSettings",
+                    "realitySettings",
                     "sockopt",
                 ],
                 &format!("{p}.streamSettings"),
@@ -527,10 +707,21 @@ impl Config {
                 }
                 other => return Err(unsupported(&format!("{p}.streamSettings.network {other}"))),
             };
-            match stream["security"].as_str().unwrap_or("none") {
-                "none" | "" => {}
+            let reality = match stream["security"].as_str().unwrap_or("none") {
+                "none" | "" => None,
+                "reality" => {
+                    ensure!(
+                        matches!(transport, Transport::Raw),
+                        "{}",
+                        unsupported(&format!("{p}.streamSettings: REALITY over this network"))
+                    );
+                    Some(std::sync::Arc::new(parse_reality(
+                        &stream["realitySettings"],
+                        &format!("{p}.streamSettings.realitySettings"),
+                    )?))
+                }
                 other => return Err(unsupported(&format!("{p}.streamSettings.security {other}"))),
-            }
+            };
             for raw in ["tcpSettings", "rawSettings"] {
                 keys(
                     &stream[raw],
@@ -640,6 +831,7 @@ impl Config {
                 sniffing,
                 transport,
                 trusted_xff,
+                reality,
             });
         }
         let mut outbounds = Vec::new();
@@ -752,12 +944,37 @@ mod tests {
     }
     #[test]
     fn unported_features_fail_by_name() {
-        let error = Config::parse(r#"{"inbounds":[{"tag":"x","port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"raw","security":"reality"}}]}"#)
+        let error = Config::parse(r#"{"inbounds":[{"tag":"x","port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"raw","security":"tls"}}]}"#)
             .err()
             .unwrap()
             .to_string();
-        assert!(error.contains("security reality"), "{error}");
+        assert!(error.contains("security tls"), "{error}");
         assert!(Config::parse(r#"{"dns":{"servers":["1.1.1.1"]}}"#).is_err());
         assert!(Config::parse(r#"{"outbounds":[{"protocol":"vmess"}]}"#).is_err());
+    }
+    #[test]
+    fn reality_rejects_malformed_security_controls_without_disclosing_key() {
+        use base64::Engine;
+        let valid = serde_json::json!({"target":"127.0.0.1:443","serverNames":["target.test"],"privateKey":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1;32]),"shortIds":[""]});
+        assert!(parse_reality(&valid, "reality").is_ok());
+        for (field, value) in [
+            ("maxTimeDiff", serde_json::json!(-1)),
+            ("maxTimeDiff", serde_json::json!("1000")),
+            ("xver", serde_json::json!(-1)),
+            ("show", serde_json::json!("true")),
+            ("minClientVer", serde_json::json!(12)),
+            ("target", serde_json::json!(65536)),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            assert!(
+                parse_reality(&bad, "reality").is_err(),
+                "accepted invalid {field}"
+            );
+        }
+        let mut bad = valid;
+        bad["privateKey"] = serde_json::json!("PRIVATE_SECRET");
+        let message = parse_reality(&bad, "reality").err().unwrap().to_string();
+        assert!(!message.contains("PRIVATE_SECRET"));
     }
 }

@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 MODULE = Path(__file__).resolve().parents[1] / 'upstream.py'
 
@@ -53,8 +55,8 @@ class UpstreamTests(unittest.TestCase):
             self.module.contract(sources)
 
     def test_patch_allowlist_rejects_workflows_and_traversal(self):
-        self.module.validate_paths(['src/api.rs', 'Cargo.lock', 'tests/api.rs'])
-        for path in ['.github/workflows/ci.yml', 'scripts/upstream.py', '../src/api.rs', 'src/../../x', 'src/.hidden', 'upstream/manifest.json', 'build.rs']:
+        self.module.validate_paths(['src/api.rs', 'Cargo.lock', 'tests/api.rs', 'rcore/src/config.rs', 'rcore/tests/vision.rs', 'rcore/Cargo.toml', 'rcore/NOTICE.md'])
+        for path in ['.github/workflows/ci.yml', 'scripts/upstream.py', '../src/api.rs', 'src/../../x', 'src/.hidden', 'upstream/manifest.json', 'build.rs', 'rcore/build.rs', 'rcore/tools/run.sh', 'rcore/.git/config', 'rcore/src/.github/workflows/ci.yml', 'rcore/Cargo.lock', 'rcore/src', 'rcore/tests']:
             with self.subTest(path=path), self.assertRaises(ValueError):
                 self.module.validate_paths([path])
 
@@ -83,10 +85,65 @@ class UpstreamTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module.validate_patch(repo, patch)
 
+    def test_core_sources_fetch_only_for_changed_xray_pin(self):
+        old = {'tag': '1', 'commit': 'a' * 40, 'files': {}, 'artifacts': {'xray': 'v1.2.3'}}
+        new = {**old, 'tag': '2'}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with patch.object(self.module, 'snapshot', return_value=new), patch.object(self.module, 'blobs', return_value=('a' * 40, {})), patch.object(self.module, 'core_sources') as fetch:
+                self.module.write_candidate(output, 'HEAD', '2', output, old)
+                fetch.assert_not_called()
+                new['artifacts'] = {'xray': 'v1.2.4'}
+                self.module.write_candidate(output, 'HEAD', '2', output, old)
+                fetch.assert_called_once_with('v1.2.4', output)
+                fetch.side_effect = ValueError('source unavailable')
+                with self.assertRaisesRegex(ValueError, 'source unavailable'):
+                    self.module.write_candidate(output, 'HEAD', '2', output, old)
+
+    def test_core_sources_fixed_repositories_verified_reality_commit_and_committed_blobs(self):
+        reality_sha = 'abcdef123456' + '0' * 28
+        xray_files = {'go.mod': ('100644', b'module github.com/xtls/xray-core\nrequire github.com/xtls/reality v0.0.0-20261101010101-abcdef123456\n'), 'main.go': ('100644', b'package main'), 'api.proto': ('100644', b'syntax = "proto3";'), 'LICENSE': ('100644', b'MPL'), '.github/workflows/run.yml': ('100644', b'untrusted'), 'tools/run.sh': ('100755', b'exit 1')}
+        reality_files = {'go.mod': ('100644', b'module github.com/xtls/reality'), 'tls.go': ('100644', b'package reality'), 'LICENSE': ('100644', b'BSD')}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with patch.object(self.module, 'fetch_sources', side_effect=[('a' * 40, xray_files), (reality_sha, reality_files)]) as fetch, patch.object(self.module, 'reality_commit', return_value=reality_sha) as resolve:
+                self.module.core_sources('v26.11.9', output)
+                self.assertEqual(fetch.call_args_list[0].args, (self.module.XRAY_UPSTREAM, 'refs/tags/v26.11.9'))
+                self.assertEqual(fetch.call_args_list[1].args, (self.module.REALITY_UPSTREAM, reality_sha))
+                resolve.assert_called_once_with('abcdef123456')
+            self.assertEqual((output / 'xray-source/main.go').read_bytes(), b'package main')
+            self.assertTrue((output / 'reality-source/tls.go').is_file())
+            self.assertFalse((output / 'xray-source/.github').exists())
+            self.assertFalse((output / 'xray-source/tools').exists())
+            manifest = json.loads((output / 'reality-source/manifest.json').read_text())
+            self.assertEqual(manifest['commit'], reality_sha)
+            self.assertEqual(manifest['files']['tls.go']['sha256'], self.module.hashlib.sha256(b'package reality').hexdigest())
+            for invalid in ['--upload-pack=evil', '../v1.2.3', 'v1.2.3;evil']:
+                with self.assertRaises(ValueError):
+                    self.module.core_sources(invalid, output)
+            with patch.object(self.module, 'fetch_sources', side_effect=[('a' * 40, xray_files), ('b' * 40, reality_files)]), patch.object(self.module, 'reality_commit', return_value=reality_sha):
+                with self.assertRaisesRegex(ValueError, 'REALITY commit'):
+                    self.module.core_sources('v26.11.9', output)
+
+    def test_reality_api_requires_full_matching_commit_hash(self):
+        sha = 'abcdef123456' + '0' * 28
+        with patch.object(self.module.urllib.request, 'urlopen', return_value=io.StringIO(json.dumps({'sha': sha}))) as request:
+            self.assertEqual(self.module.reality_commit('abcdef123456'), sha)
+            self.assertEqual(request.call_args.args[0].full_url, 'https://api.github.com/repos/XTLS/REALITY/commits/abcdef123456')
+        for sha in ['b' * 40, 'abcdef123456', None, 'abcdef123456' + 'z' * 28]:
+            with patch.object(self.module.urllib.request, 'urlopen', return_value=io.StringIO(json.dumps({'sha': sha}))):
+                with self.assertRaises(ValueError):
+                    self.module.reality_commit('abcdef123456')
+        with self.assertRaises(ValueError):
+            self.module.reality_commit('../evil')
+
     def test_prompt_marks_upstream_untrusted_and_requires_tests(self):
         prompt = self.module.prompt({'tag': '3.4.5', 'commit': 'a' * 40}, {'tag': '3.4.6', 'commit': 'b' * 40})
         self.assertIn('untrusted', prompt)
-        self.assertIn('cargo test --locked', prompt)
+        self.assertIn('cargo test --workspace --locked', prompt)
+        self.assertIn('rcore/src/', prompt)
+        self.assertIn('_update/xray-source/', prompt)
+        self.assertIn('reject unported', prompt)
         self.assertIn('Do not change upstream/', prompt)
 
 

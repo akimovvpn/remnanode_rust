@@ -72,7 +72,7 @@ Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the n
 
 - gRPC API used by the node: `HandlerService` (AlterInbound add/remove user, GetInboundUsers), `StatsService` (QueryStats, GetStats, GetStatsOnline, GetStatsOnlineIpList, GetAllOnlineUsers, GetUsersStats, GetSysStats), including Xray's counter quirks.
 - VLESS inbound with UDP, Vision flow rules and `vlessRoute`, over:
-  - RAW (plain TCP, no TLS);
+  - RAW (plain TCP, or REALITY with optional `xtls-rprx-vision`);
   - WebSocket (path/host checks, early data via `Sec-WebSocket-Protocol`, `heartbeatPeriod`, Go's 404/400/405 responses to probes);
   - HTTPUpgrade (path/host checks, early data). Unlike Go, rcore keeps early data that arrives in the same packet as the upgrade request instead of dropping it.
 - `sockopt.trustedXForwardedFor` for inbounds behind nginx/CDN: the client IP the node reports comes from `X-Forwarded-For`.
@@ -80,7 +80,9 @@ Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the n
 - Routing: field rules (domain incl. `geosite:`, ip incl. `geoip:`, port, network, source, user, inboundTag, protocol, local IP/port), `IPIfNonMatch`/`IPOnDemand`, routing webhooks (torrent blocker).
 - Outbounds: freedom (domain strategies, `finalRules` and the default private-IP block) and blackhole.
 
-**Not ported yet — `rcore` refuses such configs with a named error, so keep Go Xray for them:** REALITY and TLS security, XHTTP, gRPC transport, Shadowsocks/Trojan/Hysteria/VMess, mux/XUDP (Go clients use it for UDP), QUIC sniffing, fallbacks, PROXY protocol, VLESS outbounds (cascades), DNS, balancers. A node can use `rcore` only if every inbound in its profile is on the ported list; profiles that mix in REALITY or XHTTP still need Go Xray. `GetSysStats` reports OS memory figures because Go runtime counters have no Rust equivalent.
+**REALITY/Vision is experimental.** Real Go Xray clients pass both X25519 and X25519MLKEM768 handshakes, unauthenticated HTTPS visitors reach the configured target, and Vision passes plain TCP plus inner TLS 1.2/1.3 transfers. The TLS 1.3 test verifies direct copying in both directions. Initial target-flight record lengths are mirrored; fingerprint-matched post-handshake ticket/CCS probes are not ported, so camouflage is not identical to Go REALITY. Targets must provide a compatible TLS 1.3 handshake, as with upstream. REALITY targets use TCP; PROXY protocol (`xver`), fallback rate limits and the optional ML-DSA signature are explicitly rejected. The default image continues to run Go Xray.
+
+**Not ported yet — `rcore` refuses such configs with a named error, so keep Go Xray for them:** standalone TLS security, XHTTP, gRPC transport, Shadowsocks/Trojan/Hysteria/VMess, mux/XUDP (Go clients use it for UDP), QUIC sniffing, fallbacks, PROXY protocol, VLESS outbounds (cascades), DNS, balancers. A node can use `rcore` only if every inbound in its profile is on the ported list; profiles that mix in XHTTP or other unported features still need Go Xray. `GetSysStats` reports OS memory figures because Go runtime counters have no Rust equivalent.
 
 ## Automatic upstream updates
 
@@ -88,7 +90,7 @@ Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the n
 
 1. Checks the latest Remnawave Node release and compares every source file, dependency and pinned binary against `upstream/manifest.json`. It never runs upstream code. The report is uploaded as an Actions artifact.
 2. If something changed, Claude ports the change to Rust with a read-only token. If Claude isn't configured or fails (for example, it hits a usage limit), OpenAI Codex takes over.
-3. A clean job validates the patch (only `src/`, `tests/`, `proto/`, `Cargo.*`, `Dockerfile` and docs may change; workflows and update tooling are off limits), then runs fmt, Clippy, all tests, a real Xray smoke test and a Docker build.
+3. A clean job validates the patch (only the allowed Rust sources/tests (including `rcore`), Cargo manifests, `Dockerfile` and compatibility docs may change; workflows and update tooling are off limits), then runs fmt, Clippy, all tests, a real Xray smoke test and a Docker build.
 4. Only if everything passes, it opens a **draft PR**. Nothing is merged or deployed automatically — review it.
 
 Setup, under *Settings → Secrets and variables → Actions*, add one or both:
@@ -112,4 +114,4 @@ cargo build --locked && python3 scripts/smoke.py --binary target/debug/remnanode
 
 ## License
 
-AGPL-3.0-only, same as upstream Remnawave Node.
+The management service is AGPL-3.0-only, same as upstream Remnawave Node. `rcore` carries MPL-2.0 and the Go TLS source BSD notice; see [rcore/NOTICE.md](rcore/NOTICE.md).

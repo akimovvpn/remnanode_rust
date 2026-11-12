@@ -8,6 +8,10 @@ For automated Rust port PRs, add Claude credentials (`CLAUDE_CODE_OAUTH_TOKEN` f
 
 When there is drift, the pinned official [Claude Code action](https://github.com/anthropics/claude-code-action) prepares a Rust patch first, limited to file edits plus cargo, unit-test and read-only git commands, with no web access and a read-only `GITHUB_TOKEN`. If Claude has no credentials or fails (for example, a usage limit), its partial output is discarded and the pinned [Codex action](https://github.com/openai/codex-action) runs instead, with the workspace permission profile and privilege reduction. Upstream text is explicitly treated as untrusted data. Neither agent receives repository write credentials. A fresh job with no API key validates the patch against an allowlist, rejects workflow/tooling/baseline changes and symlinks, then runs formatting, Clippy, locked Rust tests, Python tooling tests, a real Xray smoke test and a Docker build. Candidate contract fixtures are staged only in that isolated test checkout. After those checks pass, a separate job revalidates the patch, includes the candidate baseline and opens a **draft PR**. That job runs no candidate Rust code or build hooks. There is no automatic merge or deployment. Review behavior, tests and compatibility claims before merging; a green test suite does not prove an arbitrary AI translation complete.
 
+The bundled Rust core participates in the same update path. Agent patches may edit `rcore/src/`, `rcore/tests/`, `rcore/Cargo.toml` and `rcore/NOTICE.md`; core build scripts, tooling, workflows and Git metadata remain outside the allowlist. Compatibility validation requires both Docker artifact pins and `rcore/src/config.rs`'s `VERSION` to match the candidate manifest. Updating the version string alone is insufficient: port changed behavior for the advertised Rust subset, preserve explicit errors for unported behavior, update provenance and run the workspace tests, including real Go Xray interoperability tests.
+
+When the candidate changes the Xray artifact pin, the tracker fetches that exact tag only from the official `XTLS/Xray-core` repository into a temporary bare Git repository. It saves committed Go, protobuf, assembly/header, module and license files under `_update/xray-source/`. It reads the pinned REALITY pseudo-version from Xray's `go.mod`, resolves its 12-digit commit prefix through the fixed official `XTLS/REALITY` GitHub API, verifies the full commit hash and fetches that exact commit from the official repository into `_update/reality-source/`. Each source snapshot includes its revision, resolved commit and per-file SHA256 hashes. Source files are data only; no upstream build, module download or source code is executed. An unrecognized pin, module replacement, missing source or retrieval failure stops the candidate instead of asking the agent to port without source. An unchanged Xray pin causes no additional core-source network fetch.
+
 The parser handles the current upstream constant-object syntax without evaluating JavaScript. If upstream changes that syntax or introduces symlinks/submodules, automated porting fails closed and requires a maintainer to inspect and update the tooling. The schema snapshot retains original Zod source rather than an incomplete JSON Schema translation. Reports include full source data for manual inspection.
 
 Manual baseline regeneration, **after implementing and verifying the port**, is:
@@ -15,9 +19,9 @@ Manual baseline regeneration, **after implementing and verifying the port**, is:
 ```sh
 python3 scripts/upstream.py baseline /path/to/upstream EXACT_COMMIT RELEASE_TAG
 python3 -m unittest discover -s scripts/tests -v
-cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo fmt --all --check
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test --workspace --locked
 ```
 
 Review the generated baseline diff with the Rust implementation. Do not refresh it merely to silence a compatibility failure. The baseline command reads committed Git blobs, so local uncommitted upstream files never enter the snapshot. `python3 scripts/upstream.py check --output /tmp/remnanode-report` creates the same report locally without changing the checked-in baseline.

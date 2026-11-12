@@ -357,10 +357,10 @@ pub async fn accept_httpupgrade(
 }
 
 /// A stream that first yields already-read bytes.
-struct Prefixed<S> {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: S,
+pub struct Prefixed<S> {
+    pub prefix: Vec<u8>,
+    pub pos: usize,
+    pub inner: S,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {

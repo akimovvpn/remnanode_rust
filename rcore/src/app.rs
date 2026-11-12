@@ -252,17 +252,35 @@ impl Instance {
         stream.set_nodelay(true).ok();
         let tag = &inbound.tag;
         // The inbound counters wrap whatever the transport hands over (WS payload, not frames).
-        let (io, peer): (BoxIo, SocketAddr) = match &inbound.transport {
-            Transport::Raw => (Box::new(stream), peer),
-            Transport::Ws {
-                path,
-                host,
-                heartbeat,
-            } => accept_ws(stream, path, host, *heartbeat, &inbound.trusted_xff).await?,
-            Transport::HttpUpgrade { path, host } => {
-                accept_httpupgrade(stream, path, host, &inbound.trusted_xff).await?
-            }
-        };
+        let (io, peer, direct): (BoxIo, SocketAddr, Option<crate::tls13::DirectControl>) =
+            match &inbound.transport {
+                Transport::Raw => match &inbound.reality {
+                    Some(reality) => {
+                        let (io, direct) = crate::reality::accept(
+                            reality,
+                            stream,
+                            self.config.policy.level(0).handshake,
+                        )
+                        .await?;
+                        (io, peer, Some(direct))
+                    }
+                    None => (Box::new(stream), peer, None),
+                },
+                Transport::Ws {
+                    path,
+                    host,
+                    heartbeat,
+                } => {
+                    let (io, peer) =
+                        accept_ws(stream, path, host, *heartbeat, &inbound.trusted_xff).await?;
+                    (io, peer, None)
+                }
+                Transport::HttpUpgrade { path, host } => {
+                    let (io, peer) =
+                        accept_httpupgrade(stream, path, host, &inbound.trusted_xff).await?;
+                    (io, peer, None)
+                }
+            };
         let mut conn = Counted::new(
             io,
             self.counter(
@@ -285,7 +303,17 @@ impl Instance {
                 .await
                 .context("handshake timeout")?
                 .map_err(|e| e.context(format!("invalid request from {peer}")))?;
-        vless::check_flow(&request)?;
+        vless::check_flow(&request, inbound.reality.is_some())?;
+        if request.flow == vless::XRV {
+            let (io, decoded) = crate::vision::wrap(
+                conn.inner,
+                &payload,
+                request.sent_id,
+                direct.context("Vision requires REALITY")?,
+            )?;
+            conn.inner = io;
+            payload = decoded;
+        }
         if matches!(request.command, Command::Mux | Command::Rvs) {
             return Err(crate::config::unsupported(
                 "VLESS mux/xudp (v1.mux.cool) and reverse",
@@ -641,9 +669,11 @@ impl Client {
             let mut first = RESPONSE_HEADER.to_vec();
             first.extend_from_slice(data);
             self.skip.store(first.len(), Ordering::Relaxed);
-            return self.conn.write_all(&first).await;
+            self.conn.write_all(&first).await?;
+        } else {
+            self.conn.write_all(data).await?;
         }
-        self.conn.write_all(data).await
+        self.conn.flush().await
     }
 
     async fn blackhole(mut self, http: bool, udp: bool) -> Result<()> {
@@ -659,6 +689,7 @@ impl Client {
         if self.header_pending {
             self.skip.store(RESPONSE_HEADER.len(), Ordering::Relaxed);
             self.conn.write_all(&RESPONSE_HEADER).await.ok();
+            self.conn.flush().await.ok();
         }
         Ok(())
     }
@@ -832,9 +863,11 @@ impl<W: AsyncWrite + Unpin> Downlink<W> {
             let mut first = RESPONSE_HEADER.to_vec();
             first.extend_from_slice(data);
             self.skip.store(first.len(), Ordering::Relaxed);
-            return self.inner.write_all(&first).await;
+            self.inner.write_all(&first).await?;
+        } else {
+            self.inner.write_all(data).await?;
         }
-        self.inner.write_all(data).await
+        self.inner.flush().await
     }
     async fn finish(&mut self) {
         if self.header_pending {

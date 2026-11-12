@@ -48,3 +48,6 @@ ENV XRAY_LOCATION_ASSET=/usr/local/share/xray
 ENV STATE_DIR=/var/lib/remnanode
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/remnanode-rust"]
+
+COPY LICENSE /usr/share/licenses/remnanode-rust/LICENSE
+COPY rcore/LICENSE rcore/LICENSE-Go rcore/NOTICE.md /usr/share/licenses/rcore/
