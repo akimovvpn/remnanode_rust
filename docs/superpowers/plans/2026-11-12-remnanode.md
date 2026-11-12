@@ -12,10 +12,10 @@
 - No destructive rewrite of upstream repository or automatic deployment.
 
 ## Tasks
-- [ ] Core: test config injection, hashes/restarts, process failure, atomic config permissions; implement native Xray process lifecycle and system info in src/core.rs.
-- [ ] RPC: test protobuf payloads/stat grouping and real Xray requests; implement src/grpc.rs and src/operations.rs for user and stats APIs.
-- [ ] Frontend: test auth, validation, TLS/SNI, route coverage and errors; implement config/auth/api/main modules and plugins.
-- [ ] Updates: test deterministic upstream snapshot, drift and update prompt; implement scripts, contract lock, CI and AI PR workflow.
-- [ ] Integrate: run fmt/clippy/test/Python checks and real Xray smoke; review, document limitations, commit and push authorized target.
+- [x] Core: test config injection, hashes/restarts, process failure, atomic config permissions; implement native Xray process lifecycle and system info in src/core.rs.
+- [x] RPC: test protobuf payloads/stat grouping and real Xray requests; implement src/grpc.rs and src/operations.rs for user and stats APIs.
+- [x] Frontend: test auth, validation, TLS/SNI, route coverage and errors; implement config/auth/api/main modules and plugins.
+- [x] Updates: test deterministic upstream snapshot, drift and update prompt; implement scripts, contract lock, CI and AI PR workflow.
+- [x] Integrate: run fmt/clippy/test/Python checks and real Xray smoke; review, document limitations, commit and push authorized target.
 
 Shared Core interface: Core::new(binary: PathBuf, state_dir: PathBuf, endpoint: String); pub endpoint:String; pub inbounds:HashMap<String,HashSet<String>>; async start(&mut self, body:&Value)->Result<Value>; async stop(&mut self)->Result<Value>; async health(&mut self)->Value; system_info()->Value; system_stats()->Value. RPC handle(path:&str,body:&Value,core:&mut Core)->Result<Value> returns inner response. Routes wrapped as {response: ...}. Modules may add focused helpers without changing these interfaces.

@@ -1,0 +1,141 @@
+name: Track upstream releases
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: upstream-port
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      commit: ${{ steps.check.outputs.commit }}
+      ai: ${{ steps.key.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: key
+        env:
+          HAS_API_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+        run: echo "enabled=$HAS_API_KEY" >> "$GITHUB_OUTPUT"
+      - id: check
+        run: python3 scripts/upstream.py check
+      - name: Publish actionable report
+        run: cat _update/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: upstream-report
+          path: _update/
+          include-hidden-files: true
+          retention-days: 30
+  port:
+    needs: check
+    if: needs.check.outputs.changed == 'true' && needs.check.outputs.ai == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: upstream-report
+          path: _update
+      - name: Require complete contract inventory
+        run: test -f _update/contract.json && test ! -f _update/contract-error.txt
+      - run: rustup component add rustfmt clippy
+      - run: cargo fetch --locked
+      - name: Prepare Rust port without repository write credentials
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: _update/prompt.md
+          permission-profile: ':workspace'
+          safety-strategy: drop-sudo
+      - name: Export candidate patch
+        run: |
+          git -c core.hooksPath=/dev/null add --intent-to-add -- . ':!_update'
+          git -c core.hooksPath=/dev/null diff --binary --no-ext-diff --no-textconv HEAD > /tmp/port.patch
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-port
+          path: /tmp/port.patch
+  validate:
+    needs: port
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate-port
+          path: /tmp/candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: upstream-report
+          path: _update
+      - name: Validate paths and apply patch using trusted base script
+        run: python3 scripts/upstream.py apply-patch /tmp/candidate/port.patch
+      - name: Stage candidate contract in isolated test checkout
+        run: |
+          cp _update/manifest.json upstream/manifest.json
+          cp _update/contract.json upstream/contract.json
+      - run: rustup component add rustfmt clippy
+      - run: python3 scripts/check_compatibility.py
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: python3 -m unittest discover -s scripts/tests -v
+      - run: cargo build --locked
+      - name: Download and verify pinned Xray
+        run: python3 scripts/fetch_xray.py --output /tmp/xray
+      - name: Real Xray tests
+        env:
+          XRAY_BINARY: /tmp/xray/xray
+        run: cargo test --locked -- --include-ignored
+      - run: python3 scripts/smoke.py --binary target/debug/remnanode-rust --xray /tmp/xray/xray
+      - run: docker build -t remnanode-rust:upstream .
+  publish:
+    needs: [check, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate-port
+          path: /tmp/candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: upstream-report
+          path: _update
+      - name: Revalidate patch without executing candidate code
+        run: python3 scripts/upstream.py apply-patch /tmp/candidate/port.patch
+      - name: Include verified upstream baseline
+        run: |
+          cp _update/manifest.json upstream/manifest.json
+          cp _update/contract.json upstream/contract.json
+          git config core.hooksPath /dev/null
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          branch: automated/upstream-${{ needs.check.outputs.commit }}
+          title: Port latest upstream release to Rust
+          commit-message: Port verified upstream release to Rust
+          body-path: _update/report.md
+          draft: true
+          add-paths: |
+            .
+            :!_update
