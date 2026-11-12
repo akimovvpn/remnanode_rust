@@ -75,10 +75,12 @@ Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the n
   - RAW (plain TCP, or REALITY with optional `xtls-rprx-vision`);
   - WebSocket (path/host checks, early data via `Sec-WebSocket-Protocol`, `heartbeatPeriod`, Go's 404/400/405 responses to probes);
   - HTTPUpgrade (path/host checks, early data). Unlike Go, rcore keeps early data that arrives in the same packet as the upgrade request instead of dropping it.
+- Linux outbound `streamSettings.sockopt.interface` binding and `tcpFastOpen`, including WARP interfaces; binding errors fail the connection without using the default interface.
+- SOCKS5 outbound TCP and UDP with remote domain resolution and optional username/password authentication, using simplified `settings.address` / `port` / `user` / `pass` fields.
 - `sockopt.trustedXForwardedFor` for inbounds behind nginx/CDN: the client IP the node reports comes from `X-Forwarded-For`.
 - Sniffing (HTTP, TLS, BitTorrent) with `destOverride`, `domainsExcluded`, `routeOnly`.
 - Routing: field rules (domain incl. `geosite:`, ip incl. `geoip:`, port, network, source, user, inboundTag, protocol, local IP/port), `IPIfNonMatch`/`IPOnDemand`, routing webhooks (torrent blocker).
-- Outbounds: freedom (domain strategies, `finalRules` and the default private-IP block) and blackhole.
+- Outbounds: freedom (domain strategies, `finalRules` and the default private-IP block), blackhole and SOCKS5.
 
 **REALITY/Vision is experimental.** Real Go Xray clients pass both X25519 and X25519MLKEM768 handshakes, unauthenticated HTTPS visitors reach the configured target, and Vision passes plain TCP plus inner TLS 1.2/1.3 transfers. The TLS 1.3 test verifies direct copying in both directions. Initial target-flight record lengths are mirrored. Native target probes now learn post-handshake record lengths and CCS tolerance using the pinned Go/Chrome 155 ClientHello templates. A local differential test requires the six handshake records and two post-handshake records to match Go REALITY exactly, then checks traffic still works. Probe results are cached per target/SNI/ALPN; the first matching authenticated connection may wait up to 12 seconds for calibration. Failed probes finish with an empty record list and the default 32-record tolerance. Targets must provide a compatible TLS 1.3 handshake, as with upstream. REALITY targets use TCP; PROXY protocol (`xver`), fallback rate limits and the optional ML-DSA signature are explicitly rejected. The default image continues to run Go Xray.
 

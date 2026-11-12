@@ -523,11 +523,13 @@ pub enum OutboundKind {
     Blackhole {
         http: bool,
     },
+    Socks(crate::socks::Server),
 }
 
 pub struct Outbound {
     pub tag: String,
     pub kind: OutboundKind,
+    pub socket: crate::socket::Options,
 }
 
 pub struct Config {
@@ -861,7 +863,58 @@ impl Config {
             .enumerate()
         {
             let p = format!("outbounds[{i}]");
-            keys(v, &["tag", "protocol", "settings"], &p)?;
+            keys(v, &["tag", "protocol", "settings", "streamSettings"], &p)?;
+            let stream = &v["streamSettings"];
+            keys(
+                stream,
+                &["network", "security", "sockopt"],
+                &format!("{p}.streamSettings"),
+            )?;
+            for field in ["network", "security"] {
+                ensure!(
+                    stream[field].is_null() || stream[field].is_string(),
+                    "{p}.streamSettings.{field} must be a string"
+                );
+            }
+            ensure!(
+                stream["network"]
+                    .as_str()
+                    .is_none_or(|n| matches!(n, "" | "raw" | "tcp")),
+                "{}",
+                unsupported(&format!("{p}.streamSettings.network"))
+            );
+            ensure!(
+                stream["security"]
+                    .as_str()
+                    .is_none_or(|s| matches!(s, "" | "none")),
+                "{}",
+                unsupported(&format!("{p}.streamSettings.security"))
+            );
+            let sockopt = &stream["sockopt"];
+            let sp = format!("{p}.streamSettings.sockopt");
+            keys(sockopt, &["interface", "tcpFastOpen"], &sp)?;
+            let interface = match &sockopt["interface"] {
+                Value::Null => String::new(),
+                Value::String(s) => s.clone(),
+                _ => bail!("{sp}.interface must be a string"),
+            };
+            ensure!(
+                !interface.contains('\0') && interface.len() < 16,
+                "{sp}.interface must be shorter than 16 bytes without NUL"
+            );
+            let tcp_fast_open = match &sockopt["tcpFastOpen"] {
+                Value::Null => None,
+                Value::Bool(b) => Some(*b),
+                Value::Number(n) => n
+                    .as_i64()
+                    .map(|i| if i < 0 { None } else { Some(i > 0) })
+                    .with_context(|| format!("{sp}.tcpFastOpen must be an integer"))?,
+                _ => bail!("{sp}.tcpFastOpen must be a boolean or integer"),
+            };
+            let socket = crate::socket::Options {
+                interface,
+                tcp_fast_open,
+            };
             let settings = &v["settings"];
             let kind = match v["protocol"].as_str() {
                 Some("freedom") => {
@@ -914,12 +967,47 @@ impl Config {
                         http: kind == "http",
                     }
                 }
+                Some("socks") => {
+                    keys(
+                        settings,
+                        &["address", "port", "user", "pass"],
+                        &format!("{p}.settings"),
+                    )?;
+                    let address = settings["address"]
+                        .as_str()
+                        .filter(|a| !a.is_empty())
+                        .with_context(|| format!("{p}.settings.address is required"))?
+                        .to_owned();
+                    let port = settings["port"]
+                        .as_u64()
+                        .filter(|p| *p > 0 && *p <= 65535)
+                        .with_context(|| format!("{p}.settings.port must be between 1 and 65535"))?
+                        as u16;
+                    let credential = |key: &str| -> Result<&str> {
+                        match &settings[key] {
+                            Value::Null => Ok(""),
+                            Value::String(s) if s.len() <= 255 => Ok(s),
+                            _ => bail!("{p}.settings.{key} must be a string of at most 255 bytes"),
+                        }
+                    };
+                    let (user, pass) = (credential("user")?, credential("pass")?);
+                    ensure!(
+                        user.is_empty() || !pass.is_empty(),
+                        "{p}.settings.pass must be nonempty when SOCKS authentication is enabled"
+                    );
+                    OutboundKind::Socks(crate::socks::Server {
+                        address,
+                        port,
+                        auth: (!user.is_empty()).then(|| (user.to_owned(), pass.to_owned())),
+                    })
+                }
                 Some(other) => return Err(unsupported(&format!("{p}.protocol {other}"))),
                 None => bail!("{p}.protocol is required"),
             };
             outbounds.push(Outbound {
                 tag: v["tag"].as_str().unwrap_or_default().to_owned(),
                 kind,
+                socket,
             });
         }
         Ok(Self {
@@ -1033,6 +1121,61 @@ mod tests {
                     .is_err()
             );
             assert!(vless_config(serde_json::json!({"decryption":"none","flow":"xtls-rprx-vision","clients":[{"id":"first","flow":invalid}]})).is_err());
+        }
+    }
+    #[test]
+    fn profile_outbounds_preserve_socket_options_and_socks_proxy() {
+        let parsed = Config::parse(&serde_json::json!({"outbounds":[
+            {"tag":"DIRECT","protocol":"freedom"},
+            {"tag":"BLOCK","protocol":"blackhole"},
+            {"tag":"warp-out","protocol":"freedom","settings":{},"streamSettings":{"sockopt":{"interface":"warp","tcpFastOpen":true}}},
+            {"tag":"psiphon-out","protocol":"socks","settings":{"address":"172.17.0.1","port":1080}}
+        ]}).to_string());
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.outbounds[2].socket.interface, "warp");
+        assert_eq!(parsed.outbounds[2].socket.tcp_fast_open, Some(true));
+        let OutboundKind::Socks(server) = &parsed.outbounds[3].kind else {
+            panic!("expected SOCKS")
+        };
+        assert_eq!(server.address, "172.17.0.1");
+        assert_eq!(server.port, 1080);
+        assert!(server.auth.is_none());
+    }
+    #[test]
+    fn unported_outbound_transports_and_invalid_socket_options_are_rejected() {
+        for stream in [
+            serde_json::json!({"network":"ws"}),
+            serde_json::json!({"security":"tls"}),
+            serde_json::json!({"network":false}),
+            serde_json::json!({"security":17}),
+            serde_json::json!({"sockopt":{"interface":false}}),
+            serde_json::json!({"sockopt":{"interface":"0123456789012345"}}),
+            serde_json::json!({"sockopt":{"interface":"lo\u{0}other"}}),
+            serde_json::json!({"sockopt":{"tcpFastOpen":"true"}}),
+            serde_json::json!({"sockopt":{"tcpFastOpen":1.5}}),
+            serde_json::json!({"sockopt":{"mark":2}}),
+        ] {
+            assert!(Config::parse(&serde_json::json!({"outbounds":[{"protocol":"freedom","streamSettings":stream}]}).to_string()).is_err(), "accepted {stream}");
+        }
+    }
+
+    #[test]
+    fn socks_credentials_and_endpoint_are_validated() {
+        for settings in [
+            serde_json::json!({}),
+            serde_json::json!({"address":"127.0.0.1","port":0}),
+            serde_json::json!({"address":"127.0.0.1","port":65536}),
+            serde_json::json!({"address":"127.0.0.1","port":1080,"user":false}),
+            serde_json::json!({"address":"127.0.0.1","port":1080,"user":"alice"}),
+            serde_json::json!({"address":"127.0.0.1","port":1080,"pass":"x".repeat(256)}),
+        ] {
+            assert!(
+                Config::parse(
+                    &serde_json::json!({"outbounds":[{"protocol":"socks","settings":settings}]})
+                        .to_string()
+                )
+                .is_err()
+            );
         }
     }
 }

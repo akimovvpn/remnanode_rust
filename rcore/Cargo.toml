@@ -24,6 +24,7 @@ sha2 = "0.10"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 percent-encoding = "2"
 ipnet = "2"
+libc = "0.2"
 prost = "0.13"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

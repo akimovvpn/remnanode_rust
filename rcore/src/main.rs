@@ -8,6 +8,8 @@ mod reality_probe;
 mod reality_profile;
 mod router;
 mod sniff;
+mod socket;
+mod socks;
 mod stats;
 mod tls13;
 mod transport;

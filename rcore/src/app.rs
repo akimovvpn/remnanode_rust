@@ -434,6 +434,42 @@ impl Instance {
         };
         match &outbound.kind {
             OutboundKind::Blackhole { http } => client.blackhole(*http, udp).await,
+            OutboundKind::Socks(server) => {
+                let addrs: Vec<_> = tokio::net::lookup_host((server.address.as_str(), server.port))
+                    .await?
+                    .collect();
+                let remote = connect(&addrs, &outbound.socket).await?;
+                remote.set_nodelay(true).ok();
+                let mut remote = Counted::new(remote, out_down.clone(), out_up.clone());
+                let (mut relay, relay_port) = tokio::time::timeout(
+                    policy.handshake,
+                    crate::socks::handshake(&mut remote, server, &dest, request.port, udp),
+                )
+                .await
+                .context("SOCKS handshake timeout")??;
+                if udp {
+                    if matches!(relay, Address::Ip(ip) if ip.is_unspecified()) {
+                        relay = Address::Ip(remote.inner.peer_addr()?.ip());
+                    }
+                    let relay = resolve(&relay, relay_port)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .context("failed to resolve SOCKS UDP relay")?;
+                    let socket = udp_connect(relay, &outbound.socket).await?;
+                    let socket = Datagram {
+                        socket,
+                        socks: Some((dest, request.port)),
+                    };
+                    let mut closed = [0u8; 1];
+                    tokio::select! {
+                        result = client.relay_udp(socket, &policy, out_up, out_down) => result,
+                        _ = remote.read(&mut closed) => Ok(()),
+                    }
+                } else {
+                    client.relay_tcp(remote, &policy).await
+                }
+            }
             OutboundKind::Freedom {
                 final_rules,
                 strategy,
@@ -450,17 +486,22 @@ impl Instance {
                         client.drain_for(Duration::from_secs(delay)).await
                     }
                     Target::Dial(addrs) if udp => {
-                        let socket = UdpSocket::bind(if addrs[0].is_ipv4() {
-                            "0.0.0.0:0"
-                        } else {
-                            "[::]:0"
-                        })
-                        .await?;
-                        socket.connect(addrs[0]).await?;
-                        client.relay_udp(socket, &policy, out_up, out_down).await
+                        let addr = *addrs.first().context("failed to resolve destination")?;
+                        let socket = udp_connect(addr, &outbound.socket).await?;
+                        client
+                            .relay_udp(
+                                Datagram {
+                                    socket,
+                                    socks: None,
+                                },
+                                &policy,
+                                out_up,
+                                out_down,
+                            )
+                            .await
                     }
                     Target::Dial(addrs) => {
-                        let remote = connect(&addrs).await?;
+                        let remote = connect(&addrs, &outbound.socket).await?;
                         if let Address::Domain(_) = dest
                             && let Some((delay, shown)) =
                                 blocked(remote.peer_addr()?, udp, final_rules)
@@ -618,12 +659,73 @@ async fn freedom_target(
     Target::Dial(addrs)
 }
 
-async fn connect(addrs: &[SocketAddr]) -> Result<TcpStream> {
+async fn resolve(dest: &Address, port: u16) -> Result<Vec<SocketAddr>> {
+    match dest {
+        Address::Ip(ip) => Ok(vec![SocketAddr::new(*ip, port)]),
+        Address::Domain(d) => Ok(tokio::net::lookup_host((d.as_str(), port)).await?.collect()),
+    }
+}
+
+async fn udp_connect(addr: SocketAddr, options: &crate::socket::Options) -> Result<UdpSocket> {
+    let socket = UdpSocket::bind(if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
+    options.apply(&socket, false)?;
+    socket.connect(addr).await?;
+    Ok(socket)
+}
+
+struct Datagram {
+    socket: UdpSocket,
+    socks: Option<(Address, u16)>,
+}
+
+impl Datagram {
+    async fn send(&self, data: &[u8]) -> Result<usize> {
+        if let Some((dest, port)) = &self.socks {
+            let packet = crate::socks::udp_encode(dest, *port, data)?;
+            self.socket.send(&packet).await?;
+            Ok(packet.len())
+        } else {
+            Ok(self.socket.send(data).await?)
+        }
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> Result<(usize, usize)> {
+        let wire = self.socket.recv(buf).await?;
+        if self.socks.is_some() {
+            let payload = crate::socks::udp_decode(&buf[..wire])?;
+            let n = payload.len();
+            buf.copy_within(wire - n..wire, 0);
+            Ok((n, wire))
+        } else {
+            Ok((wire, wire))
+        }
+    }
+}
+
+async fn connect(addrs: &[SocketAddr], options: &crate::socket::Options) -> Result<TcpStream> {
     // retry.ExponentialBackoff(5, 100)
     let mut last = None;
     for attempt in 0..5u32 {
         for addr in addrs {
-            match tokio::time::timeout(Duration::from_secs(16), TcpStream::connect(addr)).await {
+            let socket = if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()
+            } else {
+                tokio::net::TcpSocket::new_v6()
+            };
+            let socket = match socket {
+                Ok(socket) => socket,
+                Err(error) => {
+                    last = Some(error.into());
+                    continue;
+                }
+            };
+            options.apply(&socket, true)?;
+            match tokio::time::timeout(Duration::from_secs(16), socket.connect(*addr)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => last = Some(anyhow::Error::from(e)),
                 Err(_) => last = Some(anyhow::anyhow!("dial timeout")),
@@ -776,7 +878,7 @@ impl Client {
 
     async fn relay_udp(
         mut self,
-        socket: UdpSocket,
+        socket: Datagram,
         policy: &LevelPolicy,
         out_up: Option<Arc<Counter>>,
         out_down: Option<Arc<Counter>>,
@@ -804,10 +906,10 @@ impl Client {
                     if let Some(c) = &user_up {
                         c.add(packet.len() as i64);
                     }
+                    let wire = socket.send(&packet).await?;
                     if let Some(c) = &out_up {
-                        c.add(packet.len() as i64);
+                        c.add(wire as i64);
                     }
-                    socket.send(&packet).await?;
                     activity.touch();
                 }
                 let n = client_read.read(&mut buf).await?;
@@ -817,26 +919,25 @@ impl Client {
                 pending.extend_from_slice(&buf[..n]);
             }
             activity.set_timeout(policy.downlink_only);
-            io::Result::Ok(())
+            Result::<()>::Ok(())
         };
         let downlink = async {
             let mut buf = vec![0u8; 65535];
             loop {
-                let n = socket.recv(&mut buf).await?;
+                let (n, wire) = socket.recv(&mut buf).await?;
                 activity.touch();
                 if let Some(c) = &out_down {
-                    c.add(n as i64);
+                    c.add(wire as i64);
                 }
                 let mut framed = (n as u16).to_be_bytes().to_vec();
                 framed.extend_from_slice(&buf[..n]);
                 down.write_raw(&framed, n).await?;
             }
             #[allow(unreachable_code)]
-            io::Result::Ok(())
+            Result::<()>::Ok(())
         };
         tokio::select! {
-            result = uplink => { result?; activity.expired().await; }
-            result = downlink => { result?; }
+            result = async { tokio::try_join!(uplink, downlink) } => { result?; }
             _ = activity.expired() => {}
         }
         Ok(())
