@@ -6,6 +6,7 @@ mod geodata;
 mod router;
 mod sniff;
 mod stats;
+mod transport;
 mod vless;
 
 use anyhow::{Context, Result};

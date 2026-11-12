@@ -1420,11 +1420,14 @@ name = "rcore"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "http",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "ipnet",
+ "percent-encoding",
  "prost",
  "regex",
  "remnanode-rust",

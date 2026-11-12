@@ -71,12 +71,16 @@ The image is built for amd64 and arm64 and is only published after CI passes on 
 Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the node's own operations on both cores and requires identical results; `rcore/tests/interop.rs` uses a real Go Xray VLESS client):
 
 - gRPC API used by the node: `HandlerService` (AlterInbound add/remove user, GetInboundUsers), `StatsService` (QueryStats, GetStats, GetStatsOnline, GetStatsOnlineIpList, GetAllOnlineUsers, GetUsersStats, GetSysStats), including Xray's counter quirks.
-- VLESS inbound over plain TCP (RAW, no TLS) with UDP; Vision flow rules; `vlessRoute`.
+- VLESS inbound with UDP, Vision flow rules and `vlessRoute`, over:
+  - RAW (plain TCP, no TLS);
+  - WebSocket (path/host checks, early data via `Sec-WebSocket-Protocol`, `heartbeatPeriod`, Go's 404/400/405 responses to probes);
+  - HTTPUpgrade (path/host checks, early data). Unlike Go, rcore keeps early data that arrives in the same packet as the upgrade request instead of dropping it.
+- `sockopt.trustedXForwardedFor` for inbounds behind nginx/CDN: the client IP the node reports comes from `X-Forwarded-For`.
 - Sniffing (HTTP, TLS, BitTorrent) with `destOverride`, `domainsExcluded`, `routeOnly`.
 - Routing: field rules (domain incl. `geosite:`, ip incl. `geoip:`, port, network, source, user, inboundTag, protocol, local IP/port), `IPIfNonMatch`/`IPOnDemand`, routing webhooks (torrent blocker).
 - Outbounds: freedom (domain strategies, `finalRules` and the default private-IP block) and blackhole.
 
-**Not ported yet — `rcore` refuses such configs with a named error, so keep Go Xray for them:** REALITY and TLS security, XHTTP, WebSocket, HTTPUpgrade, gRPC transports, Shadowsocks/Trojan/Hysteria/VMess, mux/XUDP (Go clients use it for UDP), QUIC sniffing, fallbacks, VLESS outbounds (cascades), DNS, balancers. Most real Remnawave profiles use REALITY or XHTTP, so they still need Go Xray today. `GetSysStats` reports OS memory figures because Go runtime counters have no Rust equivalent.
+**Not ported yet — `rcore` refuses such configs with a named error, so keep Go Xray for them:** REALITY and TLS security, XHTTP, gRPC transport, Shadowsocks/Trojan/Hysteria/VMess, mux/XUDP (Go clients use it for UDP), QUIC sniffing, fallbacks, PROXY protocol, VLESS outbounds (cascades), DNS, balancers. A node can use `rcore` only if every inbound in its profile is on the ported list; profiles that mix in REALITY or XHTTP still need Go Xray. `GetSysStats` reports OS memory figures because Go runtime counters have no Rust equivalent.
 
 ## Automatic upstream updates
 

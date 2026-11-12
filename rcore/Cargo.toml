@@ -9,6 +9,9 @@ repository = "https://github.com/akimovvpn/remnanode_rust"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+httpdate = "1"
+percent-encoding = "2"
 ipnet = "2"
 prost = "0.13"
 regex = "1"

@@ -41,8 +41,11 @@ async fn socks_connect(socks: u16, target: u16) -> TcpStream {
     s
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn go_xray_vless_client_talks_to_rcore() {
+/// Real Go Xray client (socks -> vless over `client_stream`) against rcore (`server_stream`).
+async fn go_client_talks_to_rcore(
+    server_stream: serde_json::Value,
+    client_stream: serde_json::Value,
+) {
     let Ok(xray) = std::env::var("XRAY_BINARY") else {
         eprintln!("XRAY_BINARY not set: skipped");
         return;
@@ -52,13 +55,14 @@ async fn go_xray_vless_client_talks_to_rcore() {
     let server = json!({
         "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": server_port, "protocol": "vless",
                       "settings": {"clients": [{"id": ID, "email": "bob"}], "decryption": "none"},
-                      "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}}],
+                      "sniffing": {"enabled": true, "destOverride": ["http", "tls"]},
+                      "streamSettings": server_stream}],
         "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]}}]
     });
     let client = json!({
         "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": false}}],
         "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": server_port,
-                       "users": [{"id": ID, "encryption": "none"}]}]}}]
+                       "users": [{"id": ID, "encryption": "none"}]}]}, "streamSettings": client_stream}]
     });
     std::fs::write(dir.path().join("server.json"), server.to_string()).unwrap();
     std::fs::write(dir.path().join("client.json"), client.to_string()).unwrap();
@@ -94,7 +98,14 @@ async fn go_xray_vless_client_talks_to_rcore() {
         }
     });
     let mut s = socks_connect(socks_port, echo_port).await;
-    for message in [&b"ping"[..], b"second message", &[7u8; 3000]] {
+    for (i, message) in [&b"ping"[..], b"second message", &[7u8; 3000]]
+        .into_iter()
+        .enumerate()
+    {
+        if i == 1 {
+            // Idle past a 1s server heartbeat (when configured) without breaking the stream.
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+        }
         s.write_all(message).await.unwrap();
         let mut back = vec![0u8; message.len()];
         tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut back))
@@ -141,4 +152,39 @@ async fn go_xray_vless_client_talks_to_rcore() {
         "{}",
         String::from_utf8_lossy(&response)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_tcp() {
+    go_client_talks_to_rcore(json!({"network": "raw"}), json!({"network": "raw"})).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket() {
+    let stream = json!({"network": "ws", "wsSettings": {"path": "/api/websocket"}});
+    go_client_talks_to_rcore(stream.clone(), stream).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_early_data_and_heartbeat() {
+    go_client_talks_to_rcore(
+        json!({"network": "ws", "wsSettings": {"path": "/api/websocket", "heartbeatPeriod": 1}}),
+        json!({"network": "ws", "wsSettings": {"path": "/api/websocket?ed=2048"}}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn httpupgrade() {
+    let stream = json!({"network": "httpupgrade", "httpupgradeSettings": {"path": "/up", "host": "example.com"}});
+    go_client_talks_to_rcore(stream.clone(), stream).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn httpupgrade_early_data() {
+    go_client_talks_to_rcore(
+        json!({"network": "httpupgrade", "httpupgradeSettings": {"path": "/up"}}),
+        json!({"network": "httpupgrade", "httpupgradeSettings": {"path": "/up?ed=2048"}}),
+    )
+    .await;
 }

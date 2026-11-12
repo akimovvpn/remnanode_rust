@@ -1,6 +1,7 @@
 //! Xray JSON config subset (infra/conf). Anything not ported fails validation by name.
 use crate::geodata::{IpMatcher, Kind, Loader};
 use crate::router::Router;
+use crate::transport::Transport;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{collections::HashMap, net::IpAddr, time::Duration};
@@ -277,6 +278,43 @@ pub struct Inbound {
     pub port: u16,
     pub kind: InboundKind,
     pub sniffing: Sniffing,
+    pub transport: Transport,
+    /// sockopt.trustedXForwardedFor header names.
+    pub trusted_xff: Vec<String>,
+}
+
+/// wsSettings / httpupgradeSettings (infra/conf transport_method.go).
+fn http_transport(settings: &Value, websocket: bool, path: &str) -> Result<(String, String)> {
+    let allowed: &[&str] = if websocket {
+        &[
+            "path",
+            "host",
+            "headers",
+            "acceptProxyProtocol",
+            "heartbeatPeriod",
+        ]
+    } else {
+        &["path", "host", "headers", "acceptProxyProtocol"]
+    };
+    keys(settings, allowed, path)?;
+    ensure!(
+        settings["acceptProxyProtocol"] != true,
+        "{}",
+        unsupported(&format!("{path}.acceptProxyProtocol"))
+    );
+    let mut host = settings["host"].as_str().unwrap_or_default().to_owned();
+    for (k, v) in settings["headers"].as_object().into_iter().flatten() {
+        if k.eq_ignore_ascii_case("host") {
+            ensure!(websocket, "{path}: \"headers\" can't contain \"host\"");
+            if host.is_empty() {
+                host = v.as_str().unwrap_or_default().to_owned();
+            }
+        }
+    }
+    Ok((
+        crate::transport::normalize_path(settings["path"].as_str().unwrap_or_default()),
+        host,
+    ))
 }
 
 pub struct FinalRule {
@@ -456,14 +494,39 @@ impl Config {
                     "security",
                     "tcpSettings",
                     "rawSettings",
+                    "wsSettings",
+                    "httpupgradeSettings",
                     "sockopt",
                 ],
                 &format!("{p}.streamSettings"),
             )?;
-            match stream["network"].as_str().unwrap_or("raw") {
-                "raw" | "tcp" => {}
+            let transport = match stream["network"].as_str().unwrap_or("raw") {
+                "raw" | "tcp" => Transport::Raw,
+                "ws" | "websocket" => {
+                    let (path, host) = http_transport(
+                        &stream["wsSettings"],
+                        true,
+                        &format!("{p}.streamSettings.wsSettings"),
+                    )?;
+                    let heartbeat = stream["wsSettings"]["heartbeatPeriod"]
+                        .as_u64()
+                        .unwrap_or(0) as u32;
+                    Transport::Ws {
+                        path,
+                        host,
+                        heartbeat,
+                    }
+                }
+                "httpupgrade" => {
+                    let (path, host) = http_transport(
+                        &stream["httpupgradeSettings"],
+                        false,
+                        &format!("{p}.streamSettings.httpupgradeSettings"),
+                    )?;
+                    Transport::HttpUpgrade { path, host }
+                }
                 other => return Err(unsupported(&format!("{p}.streamSettings.network {other}"))),
-            }
+            };
             match stream["security"].as_str().unwrap_or("none") {
                 "none" | "" => {}
                 other => return Err(unsupported(&format!("{p}.streamSettings.security {other}"))),
@@ -486,11 +549,14 @@ impl Config {
                     unsupported(&format!("{p}.streamSettings.{raw}.header {header}"))
                 );
             }
-            // Only reverse-proxy hints that do not change raw TCP behavior are accepted.
             keys(
                 &stream["sockopt"],
                 &["trustedXForwardedFor"],
                 &format!("{p}.streamSettings.sockopt"),
+            )?;
+            let trusted_xff = string_list(
+                &stream["sockopt"]["trustedXForwardedFor"],
+                &format!("{p}.streamSettings.sockopt.trustedXForwardedFor"),
             )?;
             let sniff = &v["sniffing"];
             keys(
@@ -572,6 +638,8 @@ impl Config {
                 port: port(&v["port"], &format!("{p}.port"))?,
                 kind,
                 sniffing,
+                transport,
+                trusted_xff,
             });
         }
         let mut outbounds = Vec::new();

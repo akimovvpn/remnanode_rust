@@ -5,6 +5,7 @@ use crate::{
     router::Ctx,
     sniff::{Sniff, sniff_tcp},
     stats::{Counter, OnlineGuard, Stats},
+    transport::{BoxIo, Transport, accept_httpupgrade, accept_ws},
     vless::{self, Address, Command, Users},
 };
 use anyhow::{Context, Result, bail};
@@ -250,8 +251,20 @@ impl Instance {
         let local = stream.local_addr()?;
         stream.set_nodelay(true).ok();
         let tag = &inbound.tag;
+        // The inbound counters wrap whatever the transport hands over (WS payload, not frames).
+        let (io, peer): (BoxIo, SocketAddr) = match &inbound.transport {
+            Transport::Raw => (Box::new(stream), peer),
+            Transport::Ws {
+                path,
+                host,
+                heartbeat,
+            } => accept_ws(stream, path, host, *heartbeat, &inbound.trusted_xff).await?,
+            Transport::HttpUpgrade { path, host } => {
+                accept_httpupgrade(stream, path, host, &inbound.trusted_xff).await?
+            }
+        };
         let mut conn = Counted::new(
-            stream,
+            io,
             self.counter(
                 self.config.policy.inbound_uplink && !tag.is_empty(),
                 format!("inbound>>>{tag}>>>traffic>>>uplink"),
@@ -378,7 +391,12 @@ impl Instance {
             c.add(payload.len() as i64);
         }
         let client = Client {
-            skip: conn.uncounted(),
+            // Measured against Go: only raw TCP leaves the first downlink write uncounted.
+            skip: if matches!(inbound.transport, Transport::Raw) {
+                conn.uncounted()
+            } else {
+                Arc::default()
+            },
             conn,
             payload,
             payload_counted: sniffed,
@@ -602,7 +620,7 @@ fn rand_below(n: u64) -> u64 {
 
 /// The inbound side of a VLESS session after the request header.
 struct Client {
-    conn: Counted<TcpStream>,
+    conn: Counted<BoxIo>,
     skip: Arc<AtomicUsize>,
     payload: Vec<u8>,
     payload_counted: bool,
