@@ -71,7 +71,7 @@ The image is built for amd64 and arm64 and is only published after CI passes on 
 Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the node's own operations on both cores and requires identical results; `rcore/tests/interop.rs` uses a real Go Xray VLESS client):
 
 - gRPC API used by the node: `HandlerService` (AlterInbound add/remove user, GetInboundUsers), `StatsService` (QueryStats, GetStats, GetStatsOnline, GetStatsOnlineIpList, GetAllOnlineUsers, GetUsersStats, GetSysStats), including Xray's counter quirks.
-- VLESS inbound with UDP, Vision flow rules and `vlessRoute`, over:
+- VLESS inbound with UDP, Vision flow rules, inbound `settings.flow` defaults inherited by clients with empty flows, and `vlessRoute`, over:
   - RAW (plain TCP, or REALITY with optional `xtls-rprx-vision`);
   - WebSocket (path/host checks, early data via `Sec-WebSocket-Protocol`, `heartbeatPeriod`, Go's 404/400/405 responses to probes);
   - HTTPUpgrade (path/host checks, early data). Unlike Go, rcore keeps early data that arrives in the same packet as the upgrade request instead of dropping it.

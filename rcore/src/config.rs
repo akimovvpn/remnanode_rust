@@ -239,13 +239,22 @@ pub fn parse_uuid(text: &str) -> Result<[u8; 16]> {
     Ok(id)
 }
 
-pub fn parse_user(v: &Value, path: &str) -> Result<User> {
-    keys(v, &["id", "email", "level", "flow", "encryption"], path)?;
-    let flow = v["flow"].as_str().unwrap_or_default().to_owned();
+fn parse_flow<'a>(value: &'a Value, path: &str) -> Result<&'a str> {
+    let flow = match value {
+        Value::Null => "",
+        Value::String(flow) => flow,
+        _ => bail!("{path} must be a string"),
+    };
     ensure!(
         flow.is_empty() || flow == "xtls-rprx-vision",
         "{path}: unknown flow {flow}"
     );
+    Ok(flow)
+}
+
+pub fn parse_user(v: &Value, path: &str) -> Result<User> {
+    keys(v, &["id", "email", "level", "flow", "encryption"], path)?;
+    let flow = parse_flow(&v["flow"], &format!("{path}.flow"))?.to_owned();
     Ok(User {
         email: v["email"].as_str().unwrap_or_default().to_owned(),
         level: v["level"].as_u64().unwrap_or(0) as u32,
@@ -790,7 +799,7 @@ impl Config {
                 Some("vless") => {
                     keys(
                         settings,
-                        &["clients", "decryption", "fallbacks"],
+                        &["clients", "decryption", "fallbacks", "flow"],
                         &format!("{p}.settings"),
                     )?;
                     ensure!(
@@ -803,6 +812,8 @@ impl Config {
                         "{}",
                         unsupported(&format!("{p}.settings.fallbacks"))
                     );
+                    let default_flow =
+                        parse_flow(&settings["flow"], &format!("{p}.settings.flow"))?;
                     let clients = settings["clients"]
                         .as_array()
                         .into_iter()
@@ -810,7 +821,14 @@ impl Config {
                         .enumerate();
                     InboundKind::Vless(
                         clients
-                            .map(|(j, c)| parse_user(c, &format!("{p}.settings.clients[{j}]")))
+                            .map(|(j, c)| {
+                                let mut user =
+                                    parse_user(c, &format!("{p}.settings.clients[{j}]"))?;
+                                if user.flow.is_empty() {
+                                    user.flow = default_flow.to_owned();
+                                }
+                                Ok(user)
+                            })
                             .collect::<Result<_>>()?,
                     )
                 }
@@ -977,5 +995,44 @@ mod tests {
         bad["privateKey"] = serde_json::json!("PRIVATE_SECRET");
         let message = parse_reality(&bad, "reality").err().unwrap().to_string();
         assert!(!message.contains("PRIVATE_SECRET"));
+    }
+    fn vless_config(settings: Value) -> Result<Config> {
+        Config::parse(&serde_json::json!({"inbounds":[{"tag":"test","listen":"127.0.0.1","port":12345,"protocol":"vless","settings":settings}]}).to_string())
+    }
+
+    #[test]
+    fn inbound_flow_is_inherited_by_missing_empty_and_null_client_flows() {
+        let parsed=vless_config(serde_json::json!({"decryption":"none","flow":"xtls-rprx-vision","clients":[
+            {"id":"first"},{"id":"second","flow":""},{"id":"third","flow":null},{"id":"fourth","flow":"xtls-rprx-vision"}
+        ]})).unwrap();
+        let InboundKind::Vless(users) = &parsed.inbounds[0].kind else {
+            panic!("expected VLESS")
+        };
+        assert_eq!(users.len(), 4);
+        assert!(users.iter().all(|user| user.flow == "xtls-rprx-vision"));
+        for default in [Value::Null, serde_json::json!("")] {
+            let parsed=vless_config(serde_json::json!({"decryption":"none","flow":default,"clients":[{"id":"first"},{"id":"second","flow":"xtls-rprx-vision"}]})).unwrap();
+            let InboundKind::Vless(users) = &parsed.inbounds[0].kind else {
+                panic!("expected VLESS")
+            };
+            assert_eq!(users[0].flow, "");
+            assert_eq!(users[1].flow, "xtls-rprx-vision");
+        }
+    }
+
+    #[test]
+    fn invalid_inbound_or_client_flows_are_not_silently_inherited() {
+        for invalid in [
+            serde_json::json!("xtls-rprx-direct"),
+            serde_json::json!(17),
+            serde_json::json!(false),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                vless_config(serde_json::json!({"decryption":"none","flow":invalid,"clients":[]}))
+                    .is_err()
+            );
+            assert!(vless_config(serde_json::json!({"decryption":"none","flow":"xtls-rprx-vision","clients":[{"id":"first","flow":invalid}]})).is_err());
+        }
     }
 }

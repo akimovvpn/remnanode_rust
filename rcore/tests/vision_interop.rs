@@ -113,7 +113,7 @@ async fn setup(dir: &Path, xray: &str) -> Result<(Vec<Child>, u16)> {
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let server = json!({"log": {"loglevel": "debug"},
         "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": server_port, "protocol": "vless",
-            "settings": {"clients": [{"id": ID, "email": "vision", "flow": FLOW}], "decryption": "none"},
+            "settings": {"flow": FLOW, "clients": [{"id": ID, "email": "vision"}], "decryption": "none"},
             "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
                 "target": format!("127.0.0.1:{target_port}"), "serverNames": [SNI],
                 "privateKey": b64.encode(private), "shortIds": ["0123abcd"]}}}],
