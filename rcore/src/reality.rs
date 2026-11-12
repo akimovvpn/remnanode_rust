@@ -36,6 +36,7 @@ pub struct Config {
     pub max_client_ver: Option<[u8; 3]>,
     pub max_time_diff: Duration,
     pub show: bool,
+    pub profiles: crate::reality_profile::Profiles,
 }
 
 /// Process-wide ed25519 key and Go-encoded self-signed certificate (handshake_server_tls13.go init()).
@@ -540,16 +541,55 @@ pub async fn accept(
         pos: 0,
         inner: tcp_read,
     };
-    let (read, write, sent) = tokio::time::timeout(
+    let (read, mut write, mut sent) = tokio::time::timeout(
         policy_timeout,
         handshake(&mut reader, &mut tcp_write, &hello, &auth_key, flight),
     )
     .await
     .context("REALITY: handshake timeout")??;
     drop(target);
-    // shortcut: initial flight lengths only; add fingerprint-matched post-handshake probes before claiming full camouflage parity.
-    let (stream, direct) = tls13::stream(reader, tcp_write, read, write, sent);
+    let alpn = match hello.alpn.first().map(String::as_str) {
+        None => 0,
+        Some("h2") => 2,
+        Some(_) => 1,
+    };
+    let profile = config
+        .profiles
+        .get(&config.dest, &hello.server_name, alpn)
+        .await;
+    if config.show {
+        tracing::info!(records=?profile.records,max_ignored=profile.max_ccs,"REALITY target calibration");
+    }
+    sent += replay_records(&mut tcp_write, &mut write, &profile.records, policy_timeout).await?;
+    let (mut stream, direct) = tls13::stream(reader, tcp_write, read, write, sent);
+    stream.set_max_ignored(profile.max_ccs);
     Ok((Box::new(stream), direct))
+}
+
+async fn replay_records<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    cipher: &mut Cipher,
+    lengths: &[usize],
+    limit: Duration,
+) -> Result<u64> {
+    ensure!(
+        lengths.len() <= 64
+            && lengths
+                .iter()
+                .all(|length| (22..=tls13::MAX_PLAINTEXT + 256 + 5).contains(length)),
+        "Invalid REALITY probe record lengths"
+    );
+    tokio::time::timeout(limit, async {
+        let mut sent = 0;
+        for &length in lengths {
+            let record = cipher.seal(CONTENT_APP_DATA, &[], Some(length))?;
+            writer.write_all(&record).await?;
+            sent += record.len() as u64;
+        }
+        Ok(sent)
+    })
+    .await
+    .context("REALITY post-handshake replay timed out")?
 }
 
 /// handshake() + readClientFinished(): returns the application ciphers and bytes sent.
@@ -767,6 +807,7 @@ mod tests {
             max_client_ver: None,
             max_time_diff: Duration::ZERO,
             show: false,
+            profiles: Default::default(),
         };
         let hello = ClientHello {
             original: vec![0; 80],
@@ -804,6 +845,7 @@ mod authentication_tests {
             max_client_ver: None,
             max_time_diff: Duration::from_secs(60),
             show: false,
+            profiles: Default::default(),
         };
         let client_secret = x25519_dalek::StaticSecret::from([3; 32]);
         let public = x25519_dalek::PublicKey::from(&client_secret);
@@ -936,5 +978,44 @@ mod server_hello_tests {
         let mut bad = message(&[], false);
         bad[3] ^= 1;
         assert!(parse_server_hello(&bad).is_none());
+    }
+}
+
+#[cfg(test)]
+mod post_handshake_tests {
+    use super::*;
+    #[tokio::test]
+    async fn replays_record_lengths_with_application_keys_and_keeps_sequence() {
+        let (mut sender, mut receiver) = tokio::io::duplex(1024);
+        let secret = vec![9; 32];
+        let mut cipher = Cipher::new(Suite::Aes128Gcm, secret.clone());
+        let bytes = replay_records(&mut sender, &mut cipher, &[80, 120], Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(bytes, 200);
+        assert_eq!(cipher.seq, 2);
+        let mut decrypt = Cipher::new(Suite::Aes128Gcm, secret);
+        for length in [80, 120] {
+            let (header, mut body) = tls13::read_record(&mut receiver).await.unwrap();
+            assert_eq!(body.len() + 5, length);
+            assert_eq!(
+                decrypt.open(&header, &mut body).unwrap(),
+                (CONTENT_APP_DATA, Vec::new())
+            );
+        }
+        assert!(
+            replay_records(&mut sender, &mut cipher, &[10], Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn stalled_authenticated_peer_cannot_hold_replay_open() {
+        let (mut sender, _peer) = tokio::io::duplex(1);
+        let mut cipher = Cipher::new(Suite::Aes128Gcm, vec![1; 32]);
+        let error = replay_records(&mut sender, &mut cipher, &[16384], Duration::from_millis(5))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 }

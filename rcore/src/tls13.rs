@@ -333,6 +333,7 @@ pub struct Stream<R, W> {
     pending_pos: usize,
     reply: u8,
     ignored: usize,
+    max_ignored: usize,
     read_closed: bool,
     shutdown_started: bool,
     read_error: Option<String>,
@@ -366,6 +367,7 @@ pub fn stream<R, W>(
             pending_pos: 0,
             reply: 0,
             ignored: 0,
+            max_ignored: 32,
             read_closed: false,
             shutdown_started: false,
             read_error: None,
@@ -402,6 +404,10 @@ fn poll_fill<R: AsyncRead + Unpin>(
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
+    pub fn set_max_ignored(&mut self, limit: usize) {
+        self.max_ignored = limit.max(1);
+    }
+
     fn poll_record(&mut self, cx: &mut TaskContext<'_>) -> Poll<io::Result<Option<Record>>> {
         if !ready!(poll_fill(
             &mut self.reader,
@@ -499,8 +505,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
     }
 
     fn ignored(&mut self) -> io::Result<()> {
-        self.ignored += 1;
-        if self.ignored > 32 {
+        self.ignored = self.ignored.saturating_add(1);
+        if self.ignored > self.max_ignored {
             return Err(invalid("tls: too many non-advancing records"));
         }
         Ok(())
@@ -1014,5 +1020,50 @@ mod tests {
         assert_eq!(stream.write(b"x").await.unwrap(), 1);
         stream.flush().await.unwrap();
         received.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod learned_limits_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn learned_limit_counts_empty_records_and_resets_after_data() {
+        for over_limit in [false, true] {
+            let (server, mut peer) = tokio::io::duplex(1024);
+            let (r, w) = tokio::io::split(server);
+            let (mut stream, _) = stream(
+                r,
+                w,
+                Cipher::new(Suite::Aes128Gcm, vec![7; 32]),
+                Cipher::new(Suite::Aes128Gcm, vec![8; 32]),
+                0,
+            );
+            stream.set_max_ignored(1);
+            let mut tx = Cipher::new(Suite::Aes128Gcm, vec![7; 32]);
+            peer.write_all(&tx.seal(CONTENT_APP_DATA, &[], None).unwrap())
+                .await
+                .unwrap();
+            if over_limit {
+                peer.write_all(&tx.seal(CONTENT_APP_DATA, &[], None).unwrap())
+                    .await
+                    .unwrap();
+            }
+            peer.write_all(&tx.seal(CONTENT_APP_DATA, b"x", None).unwrap())
+                .await
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read_exact(&mut byte).await.is_ok(), !over_limit);
+            if !over_limit {
+                peer.write_all(&tx.seal(CONTENT_APP_DATA, &[], None).unwrap())
+                    .await
+                    .unwrap();
+                peer.write_all(&tx.seal(CONTENT_APP_DATA, b"y", None).unwrap())
+                    .await
+                    .unwrap();
+                stream.read_exact(&mut byte).await.unwrap();
+                assert_eq!(byte, [b'y']);
+            }
+        }
     }
 }

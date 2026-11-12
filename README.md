@@ -80,9 +80,24 @@ Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the n
 - Routing: field rules (domain incl. `geosite:`, ip incl. `geoip:`, port, network, source, user, inboundTag, protocol, local IP/port), `IPIfNonMatch`/`IPOnDemand`, routing webhooks (torrent blocker).
 - Outbounds: freedom (domain strategies, `finalRules` and the default private-IP block) and blackhole.
 
-**REALITY/Vision is experimental.** Real Go Xray clients pass both X25519 and X25519MLKEM768 handshakes, unauthenticated HTTPS visitors reach the configured target, and Vision passes plain TCP plus inner TLS 1.2/1.3 transfers. The TLS 1.3 test verifies direct copying in both directions. Initial target-flight record lengths are mirrored; fingerprint-matched post-handshake ticket/CCS probes are not ported, so camouflage is not identical to Go REALITY. Targets must provide a compatible TLS 1.3 handshake, as with upstream. REALITY targets use TCP; PROXY protocol (`xver`), fallback rate limits and the optional ML-DSA signature are explicitly rejected. The default image continues to run Go Xray.
+**REALITY/Vision is experimental.** Real Go Xray clients pass both X25519 and X25519MLKEM768 handshakes, unauthenticated HTTPS visitors reach the configured target, and Vision passes plain TCP plus inner TLS 1.2/1.3 transfers. The TLS 1.3 test verifies direct copying in both directions. Initial target-flight record lengths are mirrored. Native target probes now learn post-handshake record lengths and CCS tolerance using the pinned Go/Chrome 155 ClientHello templates. A local differential test requires the six handshake records and two post-handshake records to match Go REALITY exactly, then checks traffic still works. Probe results are cached per target/SNI/ALPN; the first matching authenticated connection may wait up to 12 seconds for calibration. Failed probes finish with an empty record list and the default 32-record tolerance. Targets must provide a compatible TLS 1.3 handshake, as with upstream. REALITY targets use TCP; PROXY protocol (`xver`), fallback rate limits and the optional ML-DSA signature are explicitly rejected. The default image continues to run Go Xray.
+
+For nonempty SNI, calibration validates the target certificate and hostname. It always verifies CertificateVerify and Finished before collecting records; empty SNI skips chain/name checks to match the pinned Go probe. It uses Mozilla roots plus optional `SSL_CERT_FILE` roots, which can differ from Go's platform trust policy. Targets requiring HelloRetryRequest, TLS 1.2 probes or unsupported certificate signature schemes (including ML-DSA) fall back without calibration. The template preserves captured GREASE values and Chrome extension order, so this is not full browser-fingerprint distribution parity. Probe reads, decompression, concurrency, replay size and wait time are bounded; replaying padding never completes a target request or sends user data to the probe target.
 
 **Not ported yet — `rcore` refuses such configs with a named error, so keep Go Xray for them:** standalone TLS security, XHTTP, gRPC transport, Shadowsocks/Trojan/Hysteria/VMess, mux/XUDP (Go clients use it for UDP), QUIC sniffing, fallbacks, PROXY protocol, VLESS outbounds (cascades), DNS, balancers. A node can use `rcore` only if every inbound in its profile is on the ported list; profiles that mix in XHTTP or other unported features still need Go Xray. `GetSysStats` reports OS memory figures because Go runtime counters have no Rust equivalent.
+
+## Core startup diagnostics
+
+The node starts its panel API first and waits for the panel's `/node/xray/start` request to receive the core configuration. `rcore version` only checks the installed executable. Set `XRAY_BINARY=/usr/local/bin/rcore` to select it, recreate the container, and restart the node from the panel.
+
+Repeated `connect to Xray gRPC` warnings mean the configured API endpoint cannot be reached; they do not identify why. Check the selected executable and listening ports without printing the secret:
+
+```sh
+docker compose exec remnanode sh -c 'printf "XRAY_BINARY=%s\n" "${XRAY_BINARY:-/usr/local/bin/xray}"; printf "XRAY_API_ENDPOINT=%s\n" "${XRAY_API_ENDPOINT:-http://127.0.0.1:61000}"; ss -lntp; ls -l /var/lib/remnanode/config.json'
+docker compose logs --since=5m remnanode
+```
+
+Startup logs name the selected executable. Failed start requests include the validation/process error; core output is visible in container logs. A successful start logs `Core started and gRPC is ready`. If a Rust profile uses an unsupported feature, the failure names it; use a supported test profile or switch `XRAY_BINARY` back to `/usr/local/bin/xray` and restart through the panel. Do not share `SECRET_KEY` or the contents of the generated config.
 
 ## Automatic upstream updates
 
@@ -103,13 +118,13 @@ Then enable *Settings → Actions → General → Allow GitHub Actions to create
 ## Develop
 
 ```bash
-cargo test --locked
+cargo test --locked --workspace
 python3 -m unittest discover -s scripts/tests
 python3 scripts/fetch_xray.py --output /tmp/xray
-XRAY_BINARY=/tmp/xray/xray cargo test --locked -- --include-ignored
+XRAY_BINARY=/tmp/xray/xray cargo test --locked --workspace -- --include-ignored
 docker run --rm --cap-add NET_ADMIN -v "$PWD":/src:ro -e CARGO_TARGET_DIR=/tmp/t -e NFT_TESTS=1 -w /src rust:1-slim-trixie \
   sh -c 'apt-get update -qq && apt-get install -y -qq nftables && cargo test --locked --lib real_nftables'
-cargo build --locked && python3 scripts/smoke.py --binary target/debug/remnanode-rust --xray /tmp/xray/xray
+cargo build --locked --workspace && python3 scripts/smoke.py --binary target/debug/remnanode-rust --xray /tmp/xray/xray
 ```
 
 ## License

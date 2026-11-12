@@ -4,6 +4,8 @@ mod app;
 mod config;
 mod geodata;
 mod reality;
+mod reality_probe;
+mod reality_profile;
 mod router;
 mod sniff;
 mod stats;

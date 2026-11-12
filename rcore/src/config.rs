@@ -459,6 +459,7 @@ fn parse_reality(v: &Value, path: &str) -> Result<crate::reality::Config> {
         max_client_ver: version("maxClientVer")?,
         max_time_diff: std::time::Duration::from_millis(v["maxTimeDiff"].as_u64().unwrap_or(0)),
         show: v["show"] == true,
+        profiles: Default::default(),
     })
 }
 
