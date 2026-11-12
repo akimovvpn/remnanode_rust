@@ -1,0 +1,31 @@
+[package]
+name = "rcore"
+version = "0.1.0"
+edition = "2024"
+# Port of XTLS/Xray-core (MPL-2.0); file-level copyleft carries over to the ported code.
+license = "MPL-2.0"
+description = "Rust port of the Xray-core subset used by Remnawave Node"
+repository = "https://github.com/akimovvpn/remnanode_rust"
+
+[dependencies]
+anyhow = "1"
+ipnet = "2"
+prost = "0.13"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport"] }
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+remnanode-rust = { path = ".." }

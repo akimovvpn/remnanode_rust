@@ -59,6 +59,25 @@ The image is built for amd64 and arm64 and is only published after CI passes on 
 | `NFTABLES_ACCEPT_REPLY_TRAFFIC` | `false` | Let reply traffic bypass ingress blocks |
 | `ASN_DB_PATH` | `/usr/local/share/asn/asn-prefixes.json` | ASN prefix database ([asn-index](https://github.com/remnawave/asn-index), bundled in the image) |
 
+## Rust core (`rcore`) — work in progress
+
+`rcore/` is a Rust port of Xray-core **v26.11.9**, written from Xray's Go source, with Xray's CLI (`run -config`, `run -test`, `version`) and JSON config format. The image ships it next to Go Xray; switch a node to it with one variable:
+
+```yaml
+    environment:
+      - XRAY_BINARY=/usr/local/bin/rcore
+```
+
+Ported and proven against real Go Xray (`rcore/tests/differential.rs` runs the node's own operations on both cores and requires identical results; `rcore/tests/interop.rs` uses a real Go Xray VLESS client):
+
+- gRPC API used by the node: `HandlerService` (AlterInbound add/remove user, GetInboundUsers), `StatsService` (QueryStats, GetStats, GetStatsOnline, GetStatsOnlineIpList, GetAllOnlineUsers, GetUsersStats, GetSysStats), including Xray's counter quirks.
+- VLESS inbound over plain TCP (RAW, no TLS) with UDP; Vision flow rules; `vlessRoute`.
+- Sniffing (HTTP, TLS, BitTorrent) with `destOverride`, `domainsExcluded`, `routeOnly`.
+- Routing: field rules (domain incl. `geosite:`, ip incl. `geoip:`, port, network, source, user, inboundTag, protocol, local IP/port), `IPIfNonMatch`/`IPOnDemand`, routing webhooks (torrent blocker).
+- Outbounds: freedom (domain strategies, `finalRules` and the default private-IP block) and blackhole.
+
+**Not ported yet — `rcore` refuses such configs with a named error, so keep Go Xray for them:** REALITY and TLS security, XHTTP, WebSocket, HTTPUpgrade, gRPC transports, Shadowsocks/Trojan/Hysteria/VMess, mux/XUDP (Go clients use it for UDP), QUIC sniffing, fallbacks, VLESS outbounds (cascades), DNS, balancers. Most real Remnawave profiles use REALITY or XHTTP, so they still need Go Xray today. `GetSysStats` reports OS memory figures because Go runtime counters have no Rust equivalent.
+
 ## Automatic upstream updates
 
 `.github/workflows/upstream.yml` runs daily:

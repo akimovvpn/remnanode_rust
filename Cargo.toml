@@ -6,6 +6,9 @@ license = "AGPL-3.0-only"
 description = "Rust management service for Remnawave Node"
 repository = "https://github.com/akimovvpn/remnanode_rust"
 
+[workspace]
+members = ["rcore"]
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"

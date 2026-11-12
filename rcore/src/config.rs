@@ -1,0 +1,695 @@
+//! Xray JSON config subset (infra/conf). Anything not ported fails validation by name.
+use crate::geodata::{IpMatcher, Kind, Loader};
+use crate::router::Router;
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::Value;
+use std::{collections::HashMap, net::IpAddr, time::Duration};
+
+pub const VERSION: &str = "26.11.9";
+
+pub fn unsupported(path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "rcore does not support `{path}` yet (Xray-core v{VERSION} subset); use the Go Xray binary for this config"
+    )
+}
+
+/// Rejects keys outside `allowed` so unported features never run silently.
+pub fn keys(value: &Value, allowed: &[&str], path: &str) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        ensure!(value.is_null(), "{path} must be an object");
+        return Ok(());
+    };
+    for (key, v) in object {
+        if !allowed.contains(&key.as_str()) && !v.is_null() {
+            return Err(unsupported(&format!("{path}.{key}")));
+        }
+    }
+    Ok(())
+}
+
+/// Xray StringList: an array of strings or one comma-separated string.
+pub fn string_list(value: &Value, path: &str) -> Result<Vec<String>> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(s) => Ok(s
+            .split(',')
+            .map(|x| x.trim().to_owned())
+            .filter(|x| !x.is_empty())
+            .collect()),
+        Value::Array(items) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("{path} must contain strings"))
+            })
+            .collect(),
+        _ => bail!("{path} must be a string or an array"),
+    }
+}
+
+/// Xray PortList: number, "a-b,c" string, or array of those. Returns inclusive ranges.
+pub fn port_list(value: &Value, path: &str) -> Result<Vec<(u16, u16)>> {
+    let one = |s: &str| -> Result<(u16, u16)> {
+        let s = s.trim();
+        let (a, b) = s.split_once('-').unwrap_or((s, s));
+        let (a, b): (u16, u16) = (
+            a.trim()
+                .parse()
+                .with_context(|| format!("invalid port in {path}"))?,
+            b.trim()
+                .parse()
+                .with_context(|| format!("invalid port in {path}"))?,
+        );
+        ensure!(a <= b, "invalid port range in {path}");
+        Ok((a, b))
+    };
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Number(n) => {
+            let p = n
+                .as_u64()
+                .filter(|p| *p <= 65535)
+                .with_context(|| format!("invalid port in {path}"))? as u16;
+            Ok(vec![(p, p)])
+        }
+        Value::String(s) => s
+            .split(',')
+            .filter(|x| !x.trim().is_empty())
+            .map(one)
+            .collect(),
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                out.extend(port_list(item, path)?);
+            }
+            Ok(out)
+        }
+        _ => bail!("{path} must be a port list"),
+    }
+}
+
+fn seconds(value: &Value, default: u64) -> Result<Duration> {
+    Ok(Duration::from_secs(match value {
+        Value::Null => default,
+        v => v
+            .as_u64()
+            .context("policy timeouts must be whole seconds")?,
+    }))
+}
+
+#[derive(Clone)]
+pub struct LevelPolicy {
+    pub handshake: Duration,
+    pub conn_idle: Duration,
+    pub uplink_only: Duration,
+    pub downlink_only: Duration,
+    pub user_uplink: bool,
+    pub user_downlink: bool,
+    pub user_online: bool,
+}
+
+impl Default for LevelPolicy {
+    // features/policy SessionDefault
+    fn default() -> Self {
+        Self {
+            handshake: Duration::from_secs(60),
+            conn_idle: Duration::from_secs(300),
+            uplink_only: Duration::from_secs(1),
+            downlink_only: Duration::from_secs(1),
+            user_uplink: false,
+            user_downlink: false,
+            user_online: false,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Policy {
+    levels: HashMap<u32, LevelPolicy>,
+    pub inbound_uplink: bool,
+    pub inbound_downlink: bool,
+    pub outbound_uplink: bool,
+    pub outbound_downlink: bool,
+}
+
+impl Policy {
+    pub fn level(&self, level: u32) -> LevelPolicy {
+        self.levels.get(&level).cloned().unwrap_or_default()
+    }
+    fn parse(value: &Value) -> Result<Self> {
+        keys(value, &["levels", "system"], "policy")?;
+        let mut policy = Self::default();
+        if let Some(levels) = value.get("levels").and_then(Value::as_object) {
+            for (level, v) in levels {
+                let p = format!("policy.levels.{level}");
+                keys(
+                    v,
+                    &[
+                        "handshake",
+                        "connIdle",
+                        "uplinkOnly",
+                        "downlinkOnly",
+                        "statsUserUplink",
+                        "statsUserDownlink",
+                        "statsUserOnline",
+                        "bufferSize",
+                    ],
+                    &p,
+                )?;
+                let d = LevelPolicy::default();
+                let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+                policy.levels.insert(
+                    level
+                        .parse()
+                        .with_context(|| format!("{p}: level must be a number"))?,
+                    LevelPolicy {
+                        handshake: seconds(&v["handshake"], d.handshake.as_secs())?,
+                        conn_idle: seconds(&v["connIdle"], d.conn_idle.as_secs())?,
+                        uplink_only: seconds(&v["uplinkOnly"], d.uplink_only.as_secs())?,
+                        downlink_only: seconds(&v["downlinkOnly"], d.downlink_only.as_secs())?,
+                        user_uplink: flag("statsUserUplink"),
+                        user_downlink: flag("statsUserDownlink"),
+                        user_online: flag("statsUserOnline"),
+                    },
+                );
+            }
+        }
+        let system = &value["system"];
+        keys(
+            system,
+            &[
+                "statsInboundUplink",
+                "statsInboundDownlink",
+                "statsOutboundUplink",
+                "statsOutboundDownlink",
+            ],
+            "policy.system",
+        )?;
+        let flag = |k: &str| system.get(k).and_then(Value::as_bool).unwrap_or(false);
+        policy.inbound_uplink = flag("statsInboundUplink");
+        policy.inbound_downlink = flag("statsInboundDownlink");
+        policy.outbound_uplink = flag("statsOutboundUplink");
+        policy.outbound_downlink = flag("statsOutboundDownlink");
+        Ok(policy)
+    }
+}
+
+#[derive(Clone)]
+pub struct User {
+    pub email: String,
+    pub level: u32,
+    pub id: [u8; 16],
+    pub flow: String,
+}
+
+/// common/uuid ParseString: canonical UUIDs, or 1-30 char strings mapped through UUIDv5(SHA-1).
+pub fn parse_uuid(text: &str) -> Result<[u8; 16]> {
+    let mut id = [0u8; 16];
+    if !(32..=36).contains(&text.len()) {
+        ensure!(!text.is_empty() && text.len() <= 30, "invalid UUID: {text}");
+        use sha1::Digest;
+        let hash = sha1::Sha1::new()
+            .chain_update([0u8; 16])
+            .chain_update(text.as_bytes())
+            .finalize();
+        id.copy_from_slice(&hash[..16]);
+        id[6] = (id[6] & 0x0f) | (5 << 4);
+        id[8] = (id[8] & (0xff >> 2)) | (0x02 << 6);
+        return Ok(id);
+    }
+    let mut rest = text.as_bytes();
+    let mut at = 0;
+    for group in [4usize, 2, 2, 2, 6] {
+        if rest.first() == Some(&b'-') {
+            rest = &rest[1..];
+        }
+        ensure!(rest.len() >= group * 2, "invalid UUID: {text}");
+        for i in 0..group {
+            let hex = std::str::from_utf8(&rest[i * 2..i * 2 + 2]).ok();
+            id[at] = hex
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .with_context(|| format!("invalid UUID: {text}"))?;
+            at += 1;
+        }
+        rest = &rest[group * 2..];
+    }
+    ensure!(rest.is_empty(), "invalid UUID: {text}");
+    Ok(id)
+}
+
+pub fn parse_user(v: &Value, path: &str) -> Result<User> {
+    keys(v, &["id", "email", "level", "flow", "encryption"], path)?;
+    let flow = v["flow"].as_str().unwrap_or_default().to_owned();
+    ensure!(
+        flow.is_empty() || flow == "xtls-rprx-vision",
+        "{path}: unknown flow {flow}"
+    );
+    Ok(User {
+        email: v["email"].as_str().unwrap_or_default().to_owned(),
+        level: v["level"].as_u64().unwrap_or(0) as u32,
+        id: parse_uuid(
+            v["id"]
+                .as_str()
+                .with_context(|| format!("{path}.id is required"))?,
+        )?,
+        flow,
+    })
+}
+
+pub struct Sniffing {
+    pub enabled: bool,
+    pub dest_override: Vec<String>,
+    pub domains_excluded: crate::geodata::DomainMatcher,
+    pub metadata_only: bool,
+    pub route_only: bool,
+}
+
+pub enum InboundKind {
+    Vless(Vec<User>),
+    /// dokodemo-door routed to the api tag: served as the gRPC API listener.
+    Api,
+}
+
+pub struct Inbound {
+    pub tag: String,
+    pub listen: IpAddr,
+    pub port: u16,
+    pub kind: InboundKind,
+    pub sniffing: Sniffing,
+}
+
+pub struct FinalRule {
+    pub block: bool,
+    pub tcp: bool,
+    pub udp: bool,
+    pub ports: Vec<(u16, u16)>,
+    pub ips: Option<IpMatcher>,
+    pub delay: (u64, u64),
+}
+
+pub enum OutboundKind {
+    Freedom {
+        final_rules: Vec<FinalRule>,
+        strategy: String,
+    },
+    Blackhole {
+        http: bool,
+    },
+}
+
+pub struct Outbound {
+    pub tag: String,
+    pub kind: OutboundKind,
+}
+
+pub struct Config {
+    pub stats: bool,
+    pub policy: Policy,
+    pub inbounds: Vec<Inbound>,
+    pub outbounds: Vec<Outbound>,
+    pub router: Router,
+    pub log_level: String,
+    pub access_log: Option<String>,
+    pub error_log: Option<String>,
+}
+
+fn port(value: &Value, path: &str) -> Result<u16> {
+    match port_list(value, path)?.as_slice() {
+        [(a, b)] if a == b && *a != 0 => Ok(*a),
+        _ => Err(unsupported(&format!("{path} (port ranges/zero)"))),
+    }
+}
+
+fn parse_final_rule(v: &Value, i: usize, loader: &mut Loader) -> Result<FinalRule> {
+    let p = format!("outbounds[].settings.finalRules[{i}]");
+    keys(
+        v,
+        &[
+            "action",
+            "network",
+            "port",
+            "ip",
+            "delay",
+            "blockDelay",
+            "logLevel",
+        ],
+        &p,
+    )?;
+    let block = match v["action"].as_str() {
+        Some("allow") => false,
+        Some("block") => true,
+        other => bail!("{p}.action must be allow or block, got {other:?}"),
+    };
+    let networks = string_list(&v["network"], &format!("{p}.network"))?;
+    let delay = match &v
+        .get("blockDelay")
+        .or_else(|| v.get("delay"))
+        .cloned()
+        .unwrap_or(Value::Null)
+    {
+        Value::Null => (30, 90),
+        Value::Number(n) => {
+            let n = n.as_u64().context("delay must be a whole number")?;
+            (n, n)
+        }
+        Value::String(s) => {
+            let (a, b) = s.split_once('-').unwrap_or((s, s));
+            (a.trim().parse()?, b.trim().parse()?)
+        }
+        _ => bail!("{p}.delay must be a number or range"),
+    };
+    let ips = string_list(&v["ip"], &format!("{p}.ip"))?;
+    Ok(FinalRule {
+        block,
+        tcp: networks.is_empty() || networks.iter().any(|n| n == "tcp"),
+        udp: networks.is_empty() || networks.iter().any(|n| n == "udp"),
+        ports: port_list(&v["port"], &format!("{p}.port"))?,
+        ips: if ips.is_empty() {
+            None
+        } else {
+            Some(IpMatcher::parse(&ips, loader)?)
+        },
+        delay,
+    })
+}
+
+impl Config {
+    pub fn parse(text: &str) -> Result<Self> {
+        let root: Value = serde_json::from_str(text).context("invalid JSON config")?;
+        keys(
+            &root,
+            &[
+                "log",
+                "api",
+                "stats",
+                "policy",
+                "inbounds",
+                "outbounds",
+                "routing",
+            ],
+            "",
+        )?;
+        let log = &root["log"];
+        keys(
+            log,
+            &["loglevel", "access", "error", "dnsLog", "maskAddress"],
+            "log",
+        )?;
+        let mut loader = Loader::default();
+        let api = match &root["api"] {
+            Value::Null => None,
+            api => {
+                keys(api, &["tag", "services"], "api")?;
+                for service in string_list(&api["services"], "api.services")? {
+                    ensure!(
+                        matches!(
+                            service.as_str(),
+                            "HandlerService" | "StatsService" | "RoutingService" | "LoggerService"
+                        ),
+                        "{}",
+                        unsupported(&format!("api.services {service}"))
+                    );
+                }
+                Some(
+                    api["tag"]
+                        .as_str()
+                        .context("api.tag is required")?
+                        .to_owned(),
+                )
+            }
+        };
+        let router = Router::parse(&root["routing"], &mut loader)?;
+        let mut inbounds = Vec::new();
+        for (i, v) in root["inbounds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let p = format!("inbounds[{i}]");
+            keys(
+                v,
+                &[
+                    "tag",
+                    "listen",
+                    "port",
+                    "protocol",
+                    "settings",
+                    "streamSettings",
+                    "sniffing",
+                ],
+                &p,
+            )?;
+            let tag = v["tag"].as_str().unwrap_or_default().to_owned();
+            let listen: IpAddr = match v["listen"].as_str() {
+                None | Some("") => "0.0.0.0".parse()?,
+                Some(ip) => ip
+                    .parse()
+                    .map_err(|_| unsupported(&format!("{p}.listen {ip} (unix sockets)")))?,
+            };
+            let stream = &v["streamSettings"];
+            keys(
+                stream,
+                &[
+                    "network",
+                    "security",
+                    "tcpSettings",
+                    "rawSettings",
+                    "sockopt",
+                ],
+                &format!("{p}.streamSettings"),
+            )?;
+            match stream["network"].as_str().unwrap_or("raw") {
+                "raw" | "tcp" => {}
+                other => return Err(unsupported(&format!("{p}.streamSettings.network {other}"))),
+            }
+            match stream["security"].as_str().unwrap_or("none") {
+                "none" | "" => {}
+                other => return Err(unsupported(&format!("{p}.streamSettings.security {other}"))),
+            }
+            for raw in ["tcpSettings", "rawSettings"] {
+                keys(
+                    &stream[raw],
+                    &["header", "acceptProxyProtocol"],
+                    &format!("{p}.streamSettings.{raw}"),
+                )?;
+                ensure!(
+                    stream[raw]["acceptProxyProtocol"] != true,
+                    "{}",
+                    unsupported(&format!("{p}.streamSettings.{raw}.acceptProxyProtocol"))
+                );
+                let header = stream[raw]["header"]["type"].as_str().unwrap_or("none");
+                ensure!(
+                    header == "none",
+                    "{}",
+                    unsupported(&format!("{p}.streamSettings.{raw}.header {header}"))
+                );
+            }
+            // Only reverse-proxy hints that do not change raw TCP behavior are accepted.
+            keys(
+                &stream["sockopt"],
+                &["trustedXForwardedFor"],
+                &format!("{p}.streamSettings.sockopt"),
+            )?;
+            let sniff = &v["sniffing"];
+            keys(
+                sniff,
+                &[
+                    "enabled",
+                    "destOverride",
+                    "domainsExcluded",
+                    "metadataOnly",
+                    "routeOnly",
+                ],
+                &format!("{p}.sniffing"),
+            )?;
+            let dest_override = string_list(&sniff["destOverride"], "sniffing.destOverride")?;
+            for d in &dest_override {
+                ensure!(
+                    matches!(d.as_str(), "http" | "tls" | "quic" | "fakedns"),
+                    "{p}.sniffing.destOverride: unknown protocol {d}"
+                );
+            }
+            ensure!(
+                !dest_override.iter().any(|d| d == "fakedns"),
+                "{}",
+                unsupported(&format!("{p}.sniffing.destOverride fakedns"))
+            );
+            let sniffing = Sniffing {
+                enabled: sniff["enabled"] == true,
+                dest_override,
+                domains_excluded: crate::geodata::DomainMatcher::parse(
+                    &string_list(&sniff["domainsExcluded"], "sniffing.domainsExcluded")?,
+                    Kind::Substr,
+                    &mut loader,
+                )?,
+                metadata_only: sniff["metadataOnly"] == true,
+                route_only: sniff["routeOnly"] == true,
+            };
+            let settings = &v["settings"];
+            let kind = match v["protocol"].as_str() {
+                Some("vless") => {
+                    keys(
+                        settings,
+                        &["clients", "decryption", "fallbacks"],
+                        &format!("{p}.settings"),
+                    )?;
+                    ensure!(
+                        settings["decryption"] == "none",
+                        "{}",
+                        unsupported(&format!("{p}.settings.decryption (only \"none\")"))
+                    );
+                    ensure!(
+                        settings["fallbacks"].as_array().is_none_or(Vec::is_empty),
+                        "{}",
+                        unsupported(&format!("{p}.settings.fallbacks"))
+                    );
+                    let clients = settings["clients"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .enumerate();
+                    InboundKind::Vless(
+                        clients
+                            .map(|(j, c)| parse_user(c, &format!("{p}.settings.clients[{j}]")))
+                            .collect::<Result<_>>()?,
+                    )
+                }
+                Some("dokodemo-door" | "tunnel")
+                    if api
+                        .as_deref()
+                        .is_some_and(|api| router.routes_inbound_to(&tag, api)) =>
+                {
+                    InboundKind::Api
+                }
+                Some(other) => return Err(unsupported(&format!("{p}.protocol {other}"))),
+                None => bail!("{p}.protocol is required"),
+            };
+            inbounds.push(Inbound {
+                tag,
+                listen,
+                port: port(&v["port"], &format!("{p}.port"))?,
+                kind,
+                sniffing,
+            });
+        }
+        let mut outbounds = Vec::new();
+        for (i, v) in root["outbounds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let p = format!("outbounds[{i}]");
+            keys(v, &["tag", "protocol", "settings"], &p)?;
+            let settings = &v["settings"];
+            let kind = match v["protocol"].as_str() {
+                Some("freedom") => {
+                    keys(
+                        settings,
+                        &["domainStrategy", "finalRules", "userLevel"],
+                        &format!("{p}.settings"),
+                    )?;
+                    let strategy = settings["domainStrategy"]
+                        .as_str()
+                        .unwrap_or("AsIs")
+                        .to_owned();
+                    ensure!(
+                        matches!(
+                            strategy.as_str(),
+                            "AsIs"
+                                | "UseIP"
+                                | "UseIPv4"
+                                | "UseIPv6"
+                                | "UseIPv4v6"
+                                | "UseIPv6v4"
+                                | "ForceIP"
+                                | "ForceIPv4"
+                                | "ForceIPv6"
+                                | "ForceIPv4v6"
+                                | "ForceIPv6v4"
+                        ),
+                        "{p}.settings.domainStrategy: unknown {strategy}"
+                    );
+                    let rules = settings["finalRules"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .enumerate();
+                    OutboundKind::Freedom {
+                        final_rules: rules
+                            .map(|(j, r)| parse_final_rule(r, j, &mut loader))
+                            .collect::<Result<_>>()?,
+                        strategy,
+                    }
+                }
+                Some("blackhole") => {
+                    keys(settings, &["response"], &format!("{p}.settings"))?;
+                    let kind = settings["response"]["type"].as_str().unwrap_or("none");
+                    ensure!(
+                        matches!(kind, "none" | "http"),
+                        "{p}.settings.response.type must be none or http"
+                    );
+                    OutboundKind::Blackhole {
+                        http: kind == "http",
+                    }
+                }
+                Some(other) => return Err(unsupported(&format!("{p}.protocol {other}"))),
+                None => bail!("{p}.protocol is required"),
+            };
+            outbounds.push(Outbound {
+                tag: v["tag"].as_str().unwrap_or_default().to_owned(),
+                kind,
+            });
+        }
+        Ok(Self {
+            stats: !root["stats"].is_null(),
+            policy: Policy::parse(&root["policy"])?,
+            inbounds,
+            outbounds,
+            router,
+            log_level: log["loglevel"].as_str().unwrap_or("warning").to_owned(),
+            access_log: log["access"]
+                .as_str()
+                .filter(|s| !s.is_empty() && *s != "none")
+                .map(str::to_owned),
+            error_log: log["error"]
+                .as_str()
+                .filter(|s| !s.is_empty() && *s != "none")
+                .map(str::to_owned),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn uuid_parsing_matches_xray() {
+        assert_eq!(
+            parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap()[..2],
+            [0x55, 0x0e]
+        );
+        assert_eq!(
+            parse_uuid("550e8400e29b41d4a716446655440000").unwrap(),
+            parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap()
+        );
+        // Xray maps short strings through UUIDv5 (namespace zero): version 5, RFC variant.
+        let mapped = parse_uuid("example").unwrap();
+        assert_eq!(mapped[6] >> 4, 5);
+        assert_eq!(mapped[8] >> 6, 2);
+        assert!(parse_uuid("").is_err());
+        assert!(parse_uuid("zz0e8400-e29b-41d4-a716-446655440000").is_err());
+    }
+    #[test]
+    fn unported_features_fail_by_name() {
+        let error = Config::parse(r#"{"inbounds":[{"tag":"x","port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"raw","security":"reality"}}]}"#)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("security reality"), "{error}");
+        assert!(Config::parse(r#"{"dns":{"servers":["1.1.1.1"]}}"#).is_err());
+        assert!(Config::parse(r#"{"outbounds":[{"protocol":"vmess"}]}"#).is_err());
+    }
+}

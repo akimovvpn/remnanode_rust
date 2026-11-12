@@ -4,7 +4,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY upstream ./upstream
-RUN cargo build --locked --release
+COPY rcore ./rcore
+RUN cargo build --locked --release --workspace
 
 FROM debian:trixie-slim AS assets
 ARG TARGETARCH
@@ -37,6 +38,8 @@ LABEL org.opencontainers.image.source="https://github.com/akimovvpn/remnanode_ru
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 nftables && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/lib/remnanode /var/log/xray /usr/local/share/xray
 COPY --from=build /build/target/release/remnanode-rust /usr/local/bin/remnanode-rust
+# Opt-in Rust core: set XRAY_BINARY=/usr/local/bin/rcore (supported subset only; see README).
+COPY --from=build /build/target/release/rcore /usr/local/bin/rcore
 COPY --from=assets /tmp/xray/xray /usr/local/bin/xray
 COPY --from=assets /tmp/xray/geoip.dat /tmp/xray/geosite.dat /usr/local/share/xray/
 COPY --from=assets /tmp/geocheck /usr/local/bin/geocheck
