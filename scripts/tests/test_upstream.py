@@ -28,7 +28,7 @@ class UpstreamTests(unittest.TestCase):
             self.assertEqual(first, self.module.snapshot(repo, 'HEAD', '1.0'))
             self.assertEqual(set(first['files']), {'src/main.ts', 'package-lock.json', 'docker/Dockerfile'})
             (repo / 'package-lock.json').write_text('{"packages":{"node_modules/sdk":{"version":"2"}}}')
-            subprocess.run(['git', '-C', directory, 'commit', '-qam', 'upgrade'], check=True)
+            subprocess.run(['git', '-C', directory, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qam', 'upgrade'], check=True)
             second = self.module.snapshot(repo, 'HEAD', '1.1')
             self.assertEqual(self.module.changes(first, second), {'added': [], 'removed': [], 'changed': ['package-lock.json']})
 
