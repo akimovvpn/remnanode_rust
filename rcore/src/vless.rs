@@ -98,6 +98,15 @@ pub struct Request {
     pub port: u16,
 }
 
+#[derive(Debug)]
+pub struct EmptyRequest;
+impl std::fmt::Display for EmptyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("connection closed before VLESS request")
+    }
+}
+impl std::error::Error for EmptyRequest {}
+
 /// Reads exactly `n` more bytes into `buf`, reading from `r` as needed.
 async fn need<R: AsyncRead + Unpin>(
     r: &mut R,
@@ -108,6 +117,9 @@ async fn need<R: AsyncRead + Unpin>(
     while buf.len() < pos + n {
         let mut chunk = [0u8; 8192];
         let read = r.read(&mut chunk).await?;
+        if read == 0 && buf.is_empty() {
+            return Err(EmptyRequest.into());
+        }
         ensure!(read > 0, "EOF");
         buf.extend_from_slice(&chunk[..read]);
     }

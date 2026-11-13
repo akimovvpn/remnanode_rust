@@ -67,7 +67,7 @@ pub async fn probe(dest: &str, server_name: &str, alpn: u8) -> Result<ProbeResul
     Ok(result)
 }
 
-fn roots() -> Result<Vec<TrustAnchor<'static>>> {
+pub(crate) fn roots() -> Result<Vec<TrustAnchor<'static>>> {
     let mut roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
     if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
         let file = std::fs::File::open(path).context("open probe SSL_CERT_FILE")?;
@@ -294,16 +294,7 @@ async fn handshake(
                     state = 1;
                 }
                 (1, 13) if !certificate_requested => {
-                    let mut request = Cursor(body);
-                    ensure!(
-                        request.vector8()?.is_empty(),
-                        "invalid CertificateRequest context"
-                    );
-                    let exts = extensions(request.vector16()?)?;
-                    ensure!(
-                        request.0.is_empty() && exts.iter().any(|(id, _)| *id == 13),
-                        "invalid CertificateRequest"
-                    );
+                    validate_certificate_request(body)?;
                     certificate_requested = true;
                 }
                 (1, 11) | (1, 25) => {
@@ -356,12 +347,12 @@ async fn handshake(
 }
 
 #[allow(deprecated)]
-fn constant_time_equal(a: &[u8], b: &[u8]) -> Result<()> {
+pub(crate) fn constant_time_equal(a: &[u8], b: &[u8]) -> Result<()> {
     ring::constant_time::verify_slices_are_equal(a, b)
         .map_err(|_| anyhow::anyhow!("target Finished mismatch"))
 }
 
-async fn read_server_hello<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+pub(crate) async fn read_server_hello<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut hello = Vec::new();
     for _ in 0..MAX_RECORDS {
         let (header, body) = tls13::read_record(reader).await?;
@@ -383,7 +374,7 @@ async fn read_server_hello<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u
     bail!("too many ServerHello records")
 }
 
-fn server_hello<'a>(body: &'a [u8], session: &[u8]) -> Result<(Suite, u16, &'a [u8])> {
+pub(crate) fn server_hello<'a>(body: &'a [u8], session: &[u8]) -> Result<(Suite, u16, &'a [u8])> {
     let mut c = Cursor(body);
     ensure!(c.u16()? == 0x0303, "invalid ServerHello legacy version");
     let random = c.take(32)?;
@@ -468,7 +459,31 @@ fn decompress_certificate(body: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn certificates(body: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn validate_certificate_request(body: &[u8]) -> Result<()> {
+    let mut request = Cursor(body);
+    ensure!(
+        request.vector8()?.is_empty(),
+        "invalid CertificateRequest context"
+    );
+    let exts = extensions(request.vector16()?)?;
+    ensure!(request.0.is_empty(), "trailing CertificateRequest data");
+    let schemes = exts
+        .iter()
+        .find(|(id, _)| *id == 13)
+        .context("CertificateRequest missing signature_algorithms")?
+        .1;
+    let mut schemes = Cursor(schemes);
+    let list = schemes
+        .vector16()
+        .context("invalid CertificateRequest signature_algorithms")?;
+    ensure!(
+        !list.is_empty() && list.len().is_multiple_of(2) && schemes.0.is_empty(),
+        "invalid CertificateRequest signature_algorithms"
+    );
+    Ok(())
+}
+
+pub(crate) fn certificates(body: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let mut c = Cursor(body);
     ensure!(
         c.vector8()?.is_empty(),
@@ -489,7 +504,7 @@ fn certificates(body: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-fn validate_chain(
+pub(crate) fn validate_chain(
     certs: &[CertificateDer<'_>],
     roots: &[TrustAnchor<'_>],
     server_name: &str,
@@ -511,7 +526,7 @@ fn validate_chain(
     Ok(())
 }
 
-fn verify_certificate_signature(
+pub(crate) fn verify_certificate_signature(
     cert: &CertificateDer<'_>,
     body: &[u8],
     suite: Suite,
@@ -580,42 +595,40 @@ async fn probe_ccs(socket: TcpStream) -> Result<usize> {
     Ok(usize::MAX)
 }
 
-struct Cursor<'a>(&'a [u8]);
+pub(crate) struct Cursor<'a>(pub(crate) &'a [u8]);
 impl<'a> Cursor<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
         ensure!(self.0.len() >= len, "truncated probe handshake");
         let (value, rest) = self.0.split_at(len);
         self.0 = rest;
         Ok(value)
     }
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into()?))
     }
-    fn vector8(&mut self) -> Result<&'a [u8]> {
+    pub(crate) fn vector8(&mut self) -> Result<&'a [u8]> {
         let len = self.take(1)?[0] as usize;
         self.take(len)
     }
-    fn vector16(&mut self) -> Result<&'a [u8]> {
+    pub(crate) fn vector16(&mut self) -> Result<&'a [u8]> {
         let len = self.u16()? as usize;
         self.take(len)
     }
 }
-fn len24(bytes: &[u8]) -> usize {
+pub(crate) fn len24(bytes: &[u8]) -> usize {
     ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize
 }
-fn put16(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn put16(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
     out.extend_from_slice(bytes);
 }
-fn extensions(bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+pub(crate) fn extensions(bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
     let mut c = Cursor(bytes);
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     while !c.0.is_empty() {
         let id = c.u16()?;
-        ensure!(
-            !out.iter().any(|(existing, _)| *existing == id),
-            "duplicate probe extension"
-        );
+        ensure!(seen.insert(id), "duplicate probe extension");
         out.push((id, c.vector16()?));
     }
     Ok(out)

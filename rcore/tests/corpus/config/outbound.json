@@ -1,0 +1,1 @@
+{"outbounds": [{"protocol": "vless", "settings": {"address": "127.0.0.1", "port": 443, "id": "fuzz", "encryption": "none"}, "streamSettings": {"network": "raw", "security": "tls", "tlsSettings": {"serverName": "localhost", "fingerprint": "firefox"}}}]}

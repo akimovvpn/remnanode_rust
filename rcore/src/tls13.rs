@@ -339,6 +339,10 @@ pub struct Stream<R, W> {
     read_error: Option<String>,
     write_error: Option<String>,
     sizer: Sizer,
+    max_plaintext: usize,
+    max_received: usize,
+    /// Client side: NewSessionTicket messages are discarded (session tickets are disabled).
+    client: bool,
 }
 
 pub fn stream<R, W>(
@@ -376,6 +380,9 @@ pub fn stream<R, W>(
                 bytes_sent,
                 packets_sent: 0,
             },
+            client: false,
+            max_plaintext: MAX_PLAINTEXT,
+            max_received: MAX_PLAINTEXT + 256,
         },
         control,
     )
@@ -408,6 +415,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
         self.max_ignored = limit.max(1);
     }
 
+    pub fn set_max_plaintext(&mut self, limit: usize) {
+        self.max_plaintext = limit.clamp(1, MAX_PLAINTEXT);
+    }
+
+    pub fn set_max_received(&mut self, ciphertext: usize) {
+        self.max_received = ciphertext.min(MAX_PLAINTEXT + 256);
+    }
+
+    pub fn set_client(&mut self) {
+        self.client = true;
+    }
+
     fn poll_record(&mut self, cx: &mut TaskContext<'_>) -> Poll<io::Result<Option<Record>>> {
         if !ready!(poll_fill(
             &mut self.reader,
@@ -429,10 +448,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
             if self.header[0] != CONTENT_APP_DATA {
                 return Poll::Ready(Err(invalid("tls: unexpected record type")));
             }
-            self.body.resize(
-                u16::from_be_bytes([self.header[3], self.header[4]]) as usize,
-                0,
-            );
+            let size = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+            if size > self.max_received {
+                return Poll::Ready(Err(invalid("tls: record_size_limit exceeded")));
+            }
+            self.body.resize(size, 0);
         }
         if !ready!(poll_fill(
             &mut self.reader,
@@ -575,8 +595,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
                     if content.is_empty() {
                         return Poll::Ready(Err(invalid("tls: empty handshake record")));
                     }
+                    self.ignored()?;
                     self.handshake.extend_from_slice(&content);
-                    if self.handshake.len() < 4 {
+                    while self.client && self.handshake.len() >= 4 && self.handshake[0] == 4 {
+                        let len = 4
+                            + (((self.handshake[1] as usize) << 16)
+                                | ((self.handshake[2] as usize) << 8)
+                                | self.handshake[3] as usize);
+                        if len > 1 << 16 {
+                            return Poll::Ready(Err(invalid("tls: oversized NewSessionTicket")));
+                        }
+                        if self.handshake.len() < len {
+                            break;
+                        }
+                        self.handshake.drain(..len);
+                    }
+                    if self.handshake.len() < 4 || (self.client && self.handshake[0] == 4) {
                         continue;
                     }
                     if self.handshake[..4] != [24, 0, 0, 1] {
@@ -588,7 +622,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Stream<R, W> {
                     if self.handshake.len() != 5 || self.handshake[4] > 1 {
                         return Poll::Ready(Err(invalid("tls: invalid KeyUpdate")));
                     }
-                    self.ignored()?;
                     self.reply = self.handshake[4];
                     self.handshake.clear();
                     self.read = Cipher::new(
@@ -648,7 +681,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncWrite for Stream<R, W> {
             if this.control.flags() & 2 != 0 {
                 return Pin::new(&mut this.writer).poll_write(cx, bytes);
             }
-            let n = bytes.len().min(this.sizer.next());
+            let n = bytes.len().min(this.sizer.next()).min(this.max_plaintext);
             this.queue(CONTENT_APP_DATA, &bytes[..n])?;
             // The copied input is accepted even if its record still needs a later flush.
             if let Poll::Ready(result) = this.poll_drain(cx) {
@@ -858,6 +891,67 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
         }
+    }
+
+    #[tokio::test]
+    async fn negotiated_record_limit_bounds_application_writes() {
+        let (mut stream, _, mut peer) = session(65536);
+        stream.set_max_plaintext(63);
+        stream.write_all(&[3; 130]).await.unwrap();
+        let mut cipher = Cipher::new(Suite::Aes128Gcm, vec![8; 32]);
+        for size in [63, 63, 4] {
+            let (header, mut body) = read_record(&mut peer).await.unwrap();
+            let (kind, content) = cipher.open(&header, &mut body).unwrap();
+            assert_eq!(kind, CONTENT_APP_DATA);
+            assert_eq!(content, vec![3; size]);
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_record_limit_counts_padding_and_keeps_the_boundary_valid() {
+        for oversized in [false, true] {
+            let (mut stream, _, mut peer) = session(65536);
+            stream.set_max_received(80);
+            let mut cipher = Cipher::new(Suite::Aes128Gcm, vec![7; 32]);
+            let record = cipher
+                .seal(
+                    CONTENT_APP_DATA,
+                    b"x",
+                    Some(RECORD_HEADER + 80 + usize::from(oversized)),
+                )
+                .unwrap();
+            peer.write_all(&record).await.unwrap();
+            let mut byte = [0];
+            if oversized {
+                assert_eq!(
+                    stream.read(&mut byte).await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            } else {
+                assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+                assert_eq!(byte, [b'x']);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn client_bounds_session_ticket_record_floods() {
+        let (mut stream, _, mut peer) = session(65536);
+        stream.set_client();
+        stream.set_max_ignored(1);
+        let mut cipher = Cipher::new(Suite::Aes128Gcm, vec![7; 32]);
+        for _ in 0..2 {
+            peer.write_all(&cipher.seal(CONTENT_HANDSHAKE, &[4, 0, 0, 0], None).unwrap())
+                .await
+                .unwrap();
+        }
+        peer.write_all(&cipher.seal(CONTENT_APP_DATA, b"x", None).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.read(&mut [0; 1]).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]

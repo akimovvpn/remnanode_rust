@@ -1,5 +1,5 @@
-//! Port of xray-core transport/internet/{websocket,httpupgrade} server sides and
-//! common/protocol/http ApplyTrustedXForwardedFor.
+//! Port of xray-core transport/internet/{websocket,httpupgrade} server sides, the WebSocket
+//! client (gorilla dialer) and common/protocol/http ApplyTrustedXForwardedFor.
 use anyhow::{Context, Result, bail, ensure};
 use base64::{
     Engine,
@@ -39,6 +39,7 @@ pub enum Transport {
         path: String,
         host: String,
     },
+    Xhttp(std::sync::Arc<crate::xhttp::Config>),
 }
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -163,7 +164,7 @@ async fn read_request<S: AsyncRead + Unpin>(
 }
 
 /// internet.IsValidHTTPHost
-fn valid_host(request: &str, config: &str) -> bool {
+pub(crate) fn valid_host(request: &str, config: &str) -> bool {
     let (r, c) = (request.to_lowercase(), config.to_lowercase());
     if r.contains(':') {
         let h = if let Some(rest) = r.strip_prefix('[') {
@@ -179,10 +180,25 @@ fn valid_host(request: &str, config: &str) -> bool {
 /// ApplyTrustedXForwardedFor: the first X-Forwarded-For entry replaces the source (port 0)
 /// only when one of the trusted headers is present.
 fn forwarded(req: &Request, trusted: &[String], remote: SocketAddr) -> SocketAddr {
-    let Some(value) = req.header("X-Forwarded-For").filter(|v| !v.is_empty()) else {
+    forwarded_for(
+        req.header("X-Forwarded-For"),
+        |t| req.has(t),
+        trusted,
+        remote,
+    )
+}
+
+/// ApplyTrustedXForwardedFor over any header map: `has` reports whether a header is present.
+pub(crate) fn forwarded_for(
+    xff: Option<&str>,
+    has: impl Fn(&str) -> bool,
+    trusted: &[String],
+    remote: SocketAddr,
+) -> SocketAddr {
+    let Some(value) = xff.filter(|v| !v.is_empty()) else {
         return remote;
     };
-    if trusted.iter().any(|t| req.has(t)) {
+    if trusted.iter().any(|t| has(t)) {
         let first = value.split(',').next().unwrap_or_default().trim();
         if let Ok(ip) = first
             .trim_start_matches('[')
@@ -301,7 +317,10 @@ pub async fn accept_ws(
         response.push_str("\r\n");
         tcp.write_all(response.as_bytes()).await?;
         let source = forwarded(&req, trusted, remote);
-        return Ok((Box::new(websocket(tcp, early, carry, heartbeat)), source));
+        return Ok((
+            Box::new(websocket(tcp, early, carry, heartbeat, false)),
+            source,
+        ));
     }
 }
 
@@ -396,26 +415,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
     }
 }
 
-fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+/// One final frame; clients mask every frame with a fresh key (RFC 6455 5.3).
+fn frame_as(opcode: u8, payload: &[u8], client: bool) -> Vec<u8> {
+    let mask_bit = if client { 0x80 } else { 0 };
     let mut out = vec![0x80 | opcode];
     match payload.len() {
-        n if n < 126 => out.push(n as u8),
+        n if n < 126 => out.push(mask_bit | n as u8),
         n if n <= 0xffff => {
-            out.push(126);
+            out.push(mask_bit | 126);
             out.extend_from_slice(&(n as u16).to_be_bytes());
         }
         n => {
-            out.push(127);
+            out.push(mask_bit | 127);
             out.extend_from_slice(&(n as u64).to_be_bytes());
         }
     }
-    out.extend_from_slice(payload);
+    if client {
+        let mut key = [0u8; 4];
+        let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key);
+        out.extend_from_slice(&key);
+        out.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+    } else {
+        out.extend_from_slice(payload);
+    }
     out
 }
 
-/// RFC 6455 server framing behind a byte pipe, like Xray's websocket.connection:
-/// each write becomes one binary message, pings are answered, close 1000/1005 is EOF.
-fn websocket(tcp: TcpStream, early: Vec<u8>, carry: Vec<u8>, heartbeat: u32) -> DuplexStream {
+/// RFC 6455 framing behind a byte pipe, like Xray's websocket.connection: each write becomes
+/// one binary message, pings are answered, close 1000/1005 is EOF. Servers receive masked
+/// frames; clients (`client`) send masked frames and receive unmasked ones.
+fn websocket<S: AsyncRead + AsyncWrite + Send + 'static>(
+    tcp: S,
+    early: Vec<u8>,
+    carry: Vec<u8>,
+    heartbeat: u32,
+    client: bool,
+) -> DuplexStream {
     let (app, pipe) = tokio::io::duplex(64 * 1024);
     let (mut pipe_read, mut pipe_write) = tokio::io::split(pipe);
     let (tcp_read, tcp_write) = tokio::io::split(tcp);
@@ -439,14 +474,16 @@ fn websocket(tcp: TcpStream, early: Vec<u8>, carry: Vec<u8>, heartbeat: u32) -> 
                     reader.read_exact(&mut head).await?;
                     let (fin, rsv, opcode) = (head[0] & 0x80 != 0, head[0] & 0x70, head[0] & 0x0f);
                     ensure!(rsv == 0, "unexpected reserved bits");
-                    ensure!(head[1] & 0x80 != 0, "bad MASK");
+                    ensure!((head[1] & 0x80 != 0) != client, "bad MASK");
                     let len = match head[1] & 0x7f {
                         126 => reader.read_u16().await? as u64,
                         127 => reader.read_u64().await?,
                         n => n as u64,
                     };
                     let mut mask = [0u8; 4];
-                    reader.read_exact(&mut mask).await?;
+                    if !client {
+                        reader.read_exact(&mut mask).await?;
+                    }
                     if opcode >= 8 {
                         ensure!(fin && len <= 125, "bad control frame");
                     }
@@ -470,7 +507,11 @@ fn websocket(tcp: TcpStream, early: Vec<u8>, carry: Vec<u8>, heartbeat: u32) -> 
                                 } else {
                                     code.to_be_bytes().to_vec()
                                 };
-                                let _ = tcp_write.lock().await.write_all(&frame(8, &reply)).await;
+                                let _ = tcp_write
+                                    .lock()
+                                    .await
+                                    .write_all(&frame_as(8, &reply, client))
+                                    .await;
                             }
                             ensure!(code == 1000 || code == 1005, "websocket: close {code}");
                             return Ok(());
@@ -479,7 +520,7 @@ fn websocket(tcp: TcpStream, early: Vec<u8>, carry: Vec<u8>, heartbeat: u32) -> 
                             tcp_write
                                 .lock()
                                 .await
-                                .write_all(&frame(10, &payload))
+                                .write_all(&frame_as(10, &payload, client))
                                 .await?
                         }
                         10 => {}
@@ -506,12 +547,13 @@ fn websocket(tcp: TcpStream, early: Vec<u8>, carry: Vec<u8>, heartbeat: u32) -> 
                     if n == 0 {
                         break;
                     }
-                    if tcp_write.lock().await.write_all(&frame(2, &buf[..n])).await.is_err() {
+                    let message = frame_as(2, &buf[..n], client);
+                    if tcp_write.lock().await.write_all(&message).await.is_err() {
                         return;
                     }
                 }
                 _ = ping.tick(), if heartbeat > 0 => {
-                    if tcp_write.lock().await.write_all(&frame(9, &[])).await.is_err() {
+                    if tcp_write.lock().await.write_all(&frame_as(9, &[], client)).await.is_err() {
                         return;
                     }
                 }
@@ -519,11 +561,102 @@ fn websocket(tcp: TcpStream, early: Vec<u8>, carry: Vec<u8>, heartbeat: u32) -> 
         }
         let mut w = tcp_write.lock().await;
         if !closed.swap(true, Ordering::SeqCst) {
-            let _ = w.write_all(&frame(8, &1000u16.to_be_bytes())).await;
+            let _ = w
+                .write_all(&frame_as(8, &1000u16.to_be_bytes(), client))
+                .await;
         }
         let _ = w.shutdown().await;
     });
     app
+}
+
+/// The WebSocket dialer (gorilla over Xray's dialWebSocket): Go's net/http request layout,
+/// Chrome headers, optional early data in Sec-WebSocket-Protocol, then client framing.
+pub async fn connect_ws(
+    mut io: BoxIo,
+    host: &str,
+    path: &str,
+    headers: &[(String, String)],
+    early: &[u8],
+    heartbeat: u32,
+) -> Result<BoxIo> {
+    let mut key = [0u8; 16];
+    let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key);
+    let key = STANDARD.encode(key);
+    let has = |name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+    let mut fields: Vec<(String, String)> = headers.to_vec();
+    if !has("User-Agent") {
+        fields.extend(crate::browser::chrome_headers("ws", has));
+    }
+    fields.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
+    fields.extend([
+        ("Upgrade".to_owned(), "websocket".to_owned()),
+        ("Connection".to_owned(), "Upgrade".to_owned()),
+        ("Sec-WebSocket-Key".to_owned(), key.clone()),
+        ("Sec-WebSocket-Version".to_owned(), "13".to_owned()),
+    ]);
+    if !early.is_empty() {
+        fields.push((
+            "Sec-WebSocket-Protocol".to_owned(),
+            URL_SAFE_NO_PAD.encode(early),
+        ));
+    }
+    // http.Request.Write: Host, User-Agent, then the remaining headers sorted by key.
+    let agent = fields
+        .iter()
+        .position(|(k, _)| k == "User-Agent")
+        .map(|i| fields.remove(i));
+    fields.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n");
+    let agent = agent.map_or("Go-http-client/1.1".to_owned(), |(_, v)| v);
+    request.push_str(&format!("User-Agent: {agent}\r\n"));
+    for (k, v) in &fields {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str("\r\n");
+    io.write_all(request.as_bytes()).await?;
+    io.flush().await?;
+    let mut buf = Vec::new();
+    let end = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                return Ok(i);
+            }
+            ensure!(buf.len() < 64 * 1024, "WebSocket response header too large");
+            let mut chunk = [0u8; 4096];
+            let n = io.read(&mut chunk).await?;
+            ensure!(n > 0, "unexpected EOF");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    })
+    .await
+    .context("WebSocket handshake timeout")??;
+    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let carry = buf[end + 4..].to_vec();
+    let mut lines = head.split("\r\n");
+    let status = lines.next().unwrap_or_default().to_owned();
+    let header = |name: &str| {
+        head.split("\r\n")
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let expected = STANDARD.encode(
+        Sha1::new()
+            .chain_update(key.as_bytes())
+            .chain_update(WS_GUID)
+            .finalize(),
+    );
+    if status.split(' ').nth(1) != Some("101")
+        || !header("Upgrade").to_lowercase().contains("websocket")
+        || !header("Connection").to_lowercase().contains("upgrade")
+        || header("Sec-WebSocket-Accept") != expected
+    {
+        bail!("websocket: bad handshake: {status}");
+    }
+    Ok(Box::new(websocket(io, Vec::new(), carry, heartbeat, true)))
 }
 
 #[cfg(test)]

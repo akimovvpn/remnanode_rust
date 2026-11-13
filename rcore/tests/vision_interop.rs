@@ -56,7 +56,12 @@ async fn socks_connect(socks: u16, target: u16) -> Result<TcpStream> {
     Ok(stream)
 }
 
-async fn setup(dir: &Path, xray: &str) -> Result<(Vec<Child>, u16)> {
+/// `xhttp` switches both sides from RAW+Vision to XHTTP (h2 under REALITY) with these settings.
+async fn setup(
+    dir: &Path,
+    xray: &str,
+    xhttp: Option<serde_json::Value>,
+) -> Result<(Vec<Child>, u16)> {
     let cert = dir.join("target.pem");
     let key = dir.join("target.key");
     let certificate = Command::new("openssl")
@@ -113,10 +118,15 @@ async fn setup(dir: &Path, xray: &str) -> Result<(Vec<Child>, u16)> {
     let private: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
     let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private));
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (network, flow) = match &xhttp {
+        Some(_) => ("xhttp", ""),
+        None => ("raw", FLOW),
+    };
+    let xhttp = xhttp.unwrap_or(json!(null));
     let server = json!({"log": {"loglevel": "debug"},
         "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": server_port, "protocol": "vless",
-            "settings": {"flow": FLOW, "clients": [{"id": ID, "email": "vision"}], "decryption": "none"},
-            "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
+            "settings": {"flow": flow, "clients": [{"id": ID, "email": "vision"}], "decryption": "none"},
+            "streamSettings": {"network": network, "xhttpSettings": xhttp, "security": "reality", "realitySettings": {
                 "target": format!("127.0.0.1:{target_port}"), "serverNames": [SNI],
                 "privateKey": b64.encode(private), "shortIds": ["0123abcd"]}}}],
         "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]}}]
@@ -124,8 +134,8 @@ async fn setup(dir: &Path, xray: &str) -> Result<(Vec<Child>, u16)> {
     let client = json!({"log": {"loglevel": "debug"},
         "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": true, "ip": "127.0.0.1"}}],
         "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": server_port,
-            "users": [{"id": ID, "encryption": "none", "flow": FLOW}]}]},
-            "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
+            "users": [{"id": ID, "encryption": "none", "flow": flow}]}]},
+            "streamSettings": {"network": network, "xhttpSettings": xhttp, "security": "reality", "realitySettings": {
                 "serverName": SNI, "password": b64.encode(public.as_bytes()), "shortId": "0123abcd", "fingerprint": "chrome"}}}]
     });
     std::fs::write(dir.join("server.json"), server.to_string())?;
@@ -328,6 +338,7 @@ enum Check {
     Plaintext,
     InnerTls(&'static str),
     Xudp,
+    Xhttp(&'static str),
 }
 
 async fn run(check: Check) {
@@ -346,8 +357,18 @@ async fn run(check: Check) {
     }
     let dir = tempfile::tempdir().unwrap();
     let result = tokio::time::timeout(Duration::from_secs(45), async {
-        let (_processes, socks) = setup(dir.path(), &xray).await.context("Vision fixture")?;
+        let xhttp = match check {
+            Check::Xhttp(mode) => Some(json!({"mode": mode, "path": "/xh"})),
+            _ => None,
+        };
+        let (_processes, socks) = setup(dir.path(), &xray, xhttp)
+            .await
+            .context("Vision fixture")?;
         match check {
+            Check::Xhttp(_) => {
+                plaintext(socks).await?;
+                common::xudp_checks(socks).await
+            }
             Check::InnerTls(version) => inner_tls(dir.path(), socks, version).await,
             Check::Plaintext => plaintext(socks).await,
             // Vision clients send all UDP (DNS, QUIC) as XUDP inside mux.cool.
@@ -396,6 +417,21 @@ async fn vision_inner_tls13_http_upload_and_download() {
 #[tokio::test(flavor = "multi_thread")]
 async fn vision_inner_tls12_http_upload_and_download() {
     run(Check::InnerTls("-tls1_2")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_reality_h2_stream_one() {
+    run(Check::Xhttp("auto")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_reality_h2_stream_up() {
+    run(Check::Xhttp("stream-up")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_reality_h2_packet_up() {
+    run(Check::Xhttp("packet-up")).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

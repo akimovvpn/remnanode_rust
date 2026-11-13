@@ -183,7 +183,8 @@ async fn missing_interface_never_connects_through_default_route() -> Result<()> 
     let mut buf = [0];
     ensure!(
         matches!(
-            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await,
+            // Go retries the failed bind like any dial error (five attempts over one second).
+            tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await,
             Ok(Ok(0)) | Ok(Err(_))
         ),
         "failed route stayed open"

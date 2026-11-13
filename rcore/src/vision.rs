@@ -1,4 +1,5 @@
-//! Server-side xtls-rprx-vision framing, ported from Xray-core v26.11.9 proxy/proxy.go.
+//! xtls-rprx-vision framing (server and client sides), ported from Xray-core v26.11.9
+//! proxy/proxy.go.
 //! SPDX-License-Identifier: MPL-2.0
 
 use ring::rand::{SecureRandom, SystemRandom};
@@ -26,6 +27,8 @@ pub struct State {
     client_prefix: Vec<u8>,
     server_hello: Vec<u8>,
     server_done: bool,
+    /// Client side: the encoder carries the ClientHello and the decoder the ServerHello.
+    client: bool,
 }
 
 impl Default for State {
@@ -44,6 +47,21 @@ impl State {
             client_prefix: Vec::new(),
             server_hello: Vec::new(),
             server_done: false,
+            client: false,
+        }
+    }
+    fn observe_decoded(&mut self, data: &[u8]) {
+        if self.client {
+            self.observe_server(data)
+        } else {
+            self.observe_client(data)
+        }
+    }
+    fn observe_encoded(&mut self, data: &[u8]) {
+        if self.client {
+            self.observe_client(data)
+        } else {
+            self.observe_server(data)
         }
     }
     fn count_packet(&mut self, data: &[u8]) {
@@ -239,7 +257,7 @@ impl Decoder {
                 out.direct = self.command == 2;
             }
         }
-        locked(&self.state)?.observe_client(&out.data);
+        locked(&self.state)?.observe_decoded(&out.data);
         Ok(out)
     }
     /// Call at transport EOF to reject a partially received UUID or frame.
@@ -327,7 +345,7 @@ impl Encoder {
         let complete_application = self.records.observe(bytes);
         let (long_padding, command) = {
             let mut state = locked(&self.state)?;
-            state.observe_server(bytes);
+            state.observe_encoded(bytes);
             let command = if state.is_tls && complete_application {
                 if state.enable_xtls { 2 } else { 1 }
             } else if !state.is_tls12_or_above && state.packets_left <= 1 {
@@ -406,9 +424,56 @@ pub fn wrap(
             write_offset: 0,
             write_direct: false,
             response_left: 2,
+            response: None,
         }),
         initial.data,
     ))
+}
+
+/// Client side: `request` (the VLESS header) goes out unframed with the padded `first`
+/// payload (an empty `first` is the long padding that hides the header); reads start with
+/// the VLESS response header, then Vision frames.
+pub fn client(
+    io: BoxIo,
+    uuid: [u8; 16],
+    control: DirectControl,
+    request: Vec<u8>,
+    first: &[u8],
+) -> io::Result<BoxIo> {
+    let mut state = State::new();
+    state.client = true;
+    let state = Arc::new(Mutex::new(state));
+    let mut encoder = Encoder::new(uuid, state.clone());
+    let mut write_pending = request;
+    let mut rest = first;
+    let write_direct = loop {
+        let take = MAX_CONTENT.min(rest.len());
+        let encoded = encoder.encode(&rest[..take])?;
+        write_pending.extend_from_slice(&encoded.data);
+        rest = &rest[take..];
+        if rest.is_empty() || encoded.direct {
+            break encoded.direct;
+        }
+    };
+    if !rest.is_empty() {
+        // Bytes after a direct switch go out raw once the frame is flushed.
+        return Err(io::Error::other(
+            "Vision first payload spans a direct switch",
+        ));
+    }
+    Ok(Box::new(Io {
+        inner: io,
+        decoder: Decoder::new(uuid, state),
+        encoder,
+        control,
+        read_pending: Vec::new(),
+        read_offset: 0,
+        write_pending,
+        write_offset: 0,
+        write_direct,
+        response_left: 0,
+        response: Some(Vec::new()),
+    }))
 }
 
 struct Io {
@@ -422,6 +487,8 @@ struct Io {
     write_offset: usize,
     write_direct: bool,
     response_left: usize,
+    /// Client side: the VLESS response header (version, addons) still being read.
+    response: Option<Vec<u8>>,
 }
 impl Io {
     fn drain_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -466,9 +533,32 @@ impl AsyncRead for Io {
             let mut buffer = ReadBuf::new(&mut bytes);
             ready!(Pin::new(&mut self.inner).poll_read(cx, &mut buffer))?;
             if buffer.filled().is_empty() {
+                if self.response.is_some() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to read response version",
+                    )));
+                }
                 return Poll::Ready(self.decoder.finish());
             }
-            let decoded = self.decoder.decode(buffer.filled())?;
+            let mut filled = buffer.filled();
+            let header_rest;
+            if let Some(header) = self.response.as_mut() {
+                header.extend_from_slice(filled);
+                if header[0] != 0 {
+                    return Poll::Ready(Err(invalid("unexpected response version. Expecting 0")));
+                }
+                if header.len() < 2 || header.len() < 2 + header[1] as usize {
+                    continue;
+                }
+                header_rest = header.split_off(2 + header[1] as usize);
+                self.response = None;
+                filled = &header_rest;
+                if filled.is_empty() {
+                    continue;
+                }
+            }
+            let decoded = self.decoder.decode(filled)?;
             if decoded.direct {
                 self.control.read_direct();
             }

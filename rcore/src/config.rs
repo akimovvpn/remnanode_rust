@@ -294,6 +294,461 @@ pub struct Inbound {
 }
 
 /// REALITYConfig.Build (infra/conf/transport_internet.go), server side.
+/// conf.Address: an IP literal or a domain.
+fn address(v: &Value, path: &str) -> Result<crate::vless::Address> {
+    let text = v
+        .as_str()
+        .filter(|a| !a.is_empty())
+        .with_context(|| format!("{path} is not set"))?;
+    Ok(
+        match text
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            Ok(ip) => crate::vless::Address::Ip(ip.to_canonical()),
+            Err(_) => crate::vless::Address::Domain(text.to_owned()),
+        },
+    )
+}
+
+/// VLessOutboundConfig.Build (one vnext, one user) plus its stream settings.
+fn parse_vless_outbound(
+    settings: &Value,
+    stream: &Value,
+    p: &str,
+) -> Result<crate::vless_out::Server> {
+    keys(
+        settings,
+        &[
+            "address",
+            "port",
+            "level",
+            "email",
+            "id",
+            "flow",
+            "seed",
+            "encryption",
+            "reverse",
+            "testpre",
+            "testseed",
+            "vnext",
+        ],
+        &format!("{p}.settings"),
+    )?;
+    let flat = !settings["address"].is_null();
+    let (server, user) = if flat {
+        ensure!(
+            settings["reverse"].is_null(),
+            "{}",
+            unsupported(&format!("{p}.settings.reverse"))
+        );
+        (settings, settings)
+    } else {
+        let vnext = settings["vnext"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        ensure!(
+            vnext.len() == 1,
+            "VLESS settings: \"vnext\" should have one and only one member. Multiple endpoints in \"vnext\" should use multiple VLESS outbounds and routing balancer instead"
+        );
+        let server = &vnext[0];
+        keys(
+            server,
+            &["address", "port", "users"],
+            &format!("{p}.settings.vnext[0]"),
+        )?;
+        let users = server["users"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        ensure!(
+            users.len() == 1,
+            "VLESS vnext: \"users\" should have one and only one member. Multiple members in \"users\" should use multiple VLESS outbounds and routing balancer instead"
+        );
+        let user = &users[0];
+        keys(
+            user,
+            &[
+                "id",
+                "flow",
+                "encryption",
+                "level",
+                "email",
+                "reverse",
+                "testpre",
+                "testseed",
+            ],
+            &format!("{p}.settings.vnext[0].users[0]"),
+        )?;
+        ensure!(
+            user["reverse"].is_null(),
+            "VLESS users: please use simplified outbound's config style to use \"reverse\""
+        );
+        (server, user)
+    };
+    for field in ["testpre", "testseed"] {
+        ensure!(
+            user[field].is_null() || user[field] == 0 || user[field] == serde_json::json!([]),
+            "{}",
+            unsupported(&format!("{p}.settings.{field}"))
+        );
+    }
+    let address = address(&server["address"], "VLESS vnext: \"address\"")?;
+    let port = server["port"]
+        .as_u64()
+        .filter(|p| *p <= 65535)
+        .with_context(|| format!("{p}.settings.port must be between 0 and 65535"))?
+        as u16;
+    let id = parse_uuid(user["id"].as_str().unwrap_or_default())?;
+    let flow = match &user["flow"] {
+        Value::Null => String::new(),
+        Value::String(flow) => flow.clone(),
+        _ => bail!("{p}.settings.flow must be a string"),
+    };
+    ensure!(
+        matches!(
+            flow.as_str(),
+            "" | "xtls-rprx-vision" | "xtls-rprx-vision-udp443"
+        ),
+        "VLESS users: \"flow\" doesn't support \"{flow}\" in this version"
+    );
+    match user["encryption"].as_str().unwrap_or_default() {
+        "none" => {}
+        "" => bail!("VLESS users: please add/set \"encryption\":\"none\" for every user"),
+        e if e.starts_with("mlkem768x25519plus.") => {
+            return Err(unsupported(&format!("{p}.settings encryption {e}")));
+        }
+        e => bail!("VLESS users: unsupported \"encryption\": {e}"),
+    }
+    let level = match &user["level"] {
+        Value::Null => 0,
+        value => value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .with_context(|| format!("{p}.settings.level must be an unsigned 32-bit integer"))?,
+    };
+    let sp = format!("{p}.streamSettings");
+    let default_name = match &address {
+        crate::vless::Address::Ip(ip) => ip.to_string(),
+        crate::vless::Address::Domain(d) => d.clone(),
+    };
+    for raw in ["tcpSettings", "rawSettings"] {
+        keys(&stream[raw], &["header"], &format!("{sp}.{raw}"))?;
+        let header = stream[raw]["header"]["type"].as_str().unwrap_or("none");
+        ensure!(
+            header == "none",
+            "{}",
+            unsupported(&format!("{sp}.{raw}.header {header}"))
+        );
+    }
+    let ws = matches!(stream["network"].as_str(), Some("ws" | "websocket"));
+    let security = match stream["security"].as_str().unwrap_or("none") {
+        "none" | "" => crate::vless_out::Security::None,
+        "tls" => crate::vless_out::Security::Tls(parse_tls_client(
+            &stream["tlsSettings"],
+            &format!("{sp}.tlsSettings"),
+            &default_name,
+            ws,
+        )?),
+        "reality" => {
+            ensure!(
+                !ws,
+                "{}",
+                unsupported(&format!("{sp}: REALITY over WebSocket"))
+            );
+            crate::vless_out::Security::Reality(parse_reality_client(
+                &stream["realitySettings"],
+                &format!("{sp}.realitySettings"),
+                &default_name,
+            )?)
+        }
+        other => return Err(unsupported(&format!("{sp}.security {other}"))),
+    };
+    let network = match stream["network"].as_str().unwrap_or("raw") {
+        "raw" | "tcp" | "" => crate::vless_out::Network::Raw,
+        "ws" | "websocket" => {
+            let ws = &stream["wsSettings"];
+            let (path, mut host) = http_transport(ws, true, &format!("{sp}.wsSettings"))?;
+            // conf.WebSocketConfig: "?ed=N" in the path sets the early data limit.
+            let raw_path = ws["path"].as_str().unwrap_or_default();
+            let early = raw_path
+                .split_once('?')
+                .and_then(|(_, q)| {
+                    q.split('&')
+                        .find_map(|kv| kv.strip_prefix("ed="))
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if host.is_empty()
+                && let crate::vless_out::Security::Tls(tls) = &security
+            {
+                host = tls.server_name.clone();
+            }
+            if host.is_empty() {
+                host = default_name.clone();
+            }
+            let headers = ws["headers"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("host"))
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
+                .collect();
+            crate::vless_out::Network::Ws {
+                path,
+                host,
+                headers,
+                early,
+                heartbeat: ws["heartbeatPeriod"].as_u64().unwrap_or(0) as u32,
+            }
+        }
+        other => return Err(unsupported(&format!("{sp}.network {other}"))),
+    };
+    Ok(crate::vless_out::Server {
+        address,
+        port,
+        id,
+        flow,
+        level,
+        network,
+        security,
+    })
+}
+
+fn fingerprint(v: &Value, path: &str) -> Result<crate::tls_client::Fingerprint> {
+    let name = match v {
+        Value::Null => "",
+        Value::String(name) => name,
+        _ => bail!("{path}.fingerprint must be a string"),
+    };
+    crate::tls_client::Fingerprint::parse(name)
+        .ok_or_else(|| unsupported(&format!("{path}.fingerprint {name}")))
+}
+
+/// TLSConfig.Build for a client: SNI, ALPN and a uTLS fingerprint.
+fn parse_tls_client(
+    v: &Value,
+    path: &str,
+    default_name: &str,
+    websocket: bool,
+) -> Result<crate::tls_client::Client> {
+    keys(
+        v,
+        &[
+            "serverName",
+            "alpn",
+            "fingerprint",
+            "allowInsecure",
+            "pinnedPeerCertSha256",
+            "verifyPeerCertByName",
+            "echConfigList",
+            "echSockopt",
+            "certificates",
+            "disableSystemRoot",
+            "minVersion",
+            "maxVersion",
+            "cipherSuites",
+            "curvePreferences",
+            "masterKeyLog",
+            "enableSessionResumption",
+            "useSystemCA",
+            "rejectUnknownSni",
+        ],
+        path,
+    )?;
+    for field in ["serverName", "masterKeyLog"] {
+        ensure!(
+            v[field].is_null() || v[field].is_string(),
+            "{path}.{field} must be a string"
+        );
+    }
+    for field in [
+        "allowInsecure",
+        "disableSystemRoot",
+        "enableSessionResumption",
+        "useSystemCA",
+        "rejectUnknownSni",
+    ] {
+        ensure!(
+            v[field].is_null() || v[field].is_boolean(),
+            "{path}.{field} must be a boolean"
+        );
+    }
+    ensure!(
+        v["masterKeyLog"].as_str().is_none_or(str::is_empty),
+        "{}",
+        unsupported(&format!("{path}.masterKeyLog"))
+    );
+    ensure!(
+        v["echSockopt"].is_null(),
+        "{}",
+        unsupported(&format!("{path}.echSockopt"))
+    );
+    ensure!(
+        v["allowInsecure"] != true,
+        "The feature \"allowInsecure\" has been removed and migrated to \"pinnedPeerCertSha256\"(pcs) and \"verifyPeerCertByName\"(vcn)."
+    );
+    for field in [
+        "pinnedPeerCertSha256",
+        "verifyPeerCertByName",
+        "echConfigList",
+        "certificates",
+        "minVersion",
+        "maxVersion",
+        "cipherSuites",
+        "curvePreferences",
+    ] {
+        let set = match &v[field] {
+            Value::Null => false,
+            Value::String(s) => !s.is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            _ => true,
+        };
+        ensure!(!set, "{}", unsupported(&format!("{path}.{field}")));
+    }
+    for field in ["disableSystemRoot", "enableSessionResumption"] {
+        ensure!(
+            v[field] != true,
+            "{}",
+            unsupported(&format!("{path}.{field}"))
+        );
+    }
+    let configured = string_list(&v["alpn"], &format!("{path}.alpn"))?;
+    // The WebSocket dialer forces http/1.1 (WebsocketHandshakeContext).
+    let alpn = if websocket {
+        vec!["http/1.1".to_owned()]
+    } else if configured.is_empty() {
+        vec!["h2".to_owned(), "http/1.1".to_owned()]
+    } else {
+        configured
+    };
+    let server_name = v["serverName"].as_str().unwrap_or_default();
+    Ok(crate::tls_client::Client {
+        server_name: if server_name.is_empty() {
+            default_name.to_owned()
+        } else {
+            server_name.to_owned()
+        },
+        fingerprint: fingerprint(&v["fingerprint"], path)?,
+        alpn,
+        reality: None,
+    })
+}
+
+/// REALITYConfig.Build for a client.
+fn parse_reality_client(
+    v: &Value,
+    path: &str,
+    default_name: &str,
+) -> Result<crate::tls_client::Client> {
+    use base64::Engine;
+    keys(
+        v,
+        &[
+            "show",
+            "fingerprint",
+            "serverName",
+            "serverNames",
+            "password",
+            "publicKey",
+            "shortId",
+            "shortIds",
+            "mldsa65Verify",
+            "spiderX",
+            "masterKeyLog",
+        ],
+        path,
+    )?;
+    let fp = v["fingerprint"].as_str().unwrap_or_default().to_lowercase();
+    ensure!(
+        fp != "unsafe" && fp != "hellogolang",
+        "invalid \"fingerprint\": {fp}"
+    );
+    ensure!(
+        v["serverNames"].as_array().is_none_or(Vec::is_empty),
+        "non-empty \"serverNames\", please use \"serverName\" instead"
+    );
+    ensure!(
+        v["shortIds"].as_array().is_none_or(Vec::is_empty),
+        "non-empty \"shortIds\", please use \"shortId\" instead"
+    );
+    let key = v["password"]
+        .as_str()
+        .filter(|k| !k.is_empty())
+        .or(v["publicKey"].as_str())
+        .unwrap_or_default();
+    ensure!(!key.is_empty(), "empty \"password\"");
+    let public_key: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key)
+        .ok()
+        .and_then(|k| k.try_into().ok())
+        .with_context(|| format!("invalid \"password\": {key}"))?;
+    let short = v["shortId"].as_str().unwrap_or_default();
+    ensure!(short.len() <= 16, "too long \"shortId\": {short}");
+    let mut short_id = [0u8; 8];
+    ensure!(
+        short.len().is_multiple_of(2) && short.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid \"shortId\": {short}"
+    );
+    for (i, pair) in short.as_bytes().chunks(2).enumerate() {
+        short_id[i] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+    }
+    ensure!(
+        v["mldsa65Verify"].as_str().is_none_or(str::is_empty),
+        "{}",
+        unsupported(&format!("{path}.mldsa65Verify"))
+    );
+    let spider = v["spiderX"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/");
+    ensure!(spider.starts_with('/'), "invalid \"spiderX\": {spider}");
+    // spiderX query p/c/t/i/r set the spider's padding, concurrency, times, interval, return.
+    let (spider_path, query) = spider.split_once('?').unwrap_or((spider, ""));
+    let mut spider_y = [0i64; 10];
+    let mut rest = Vec::new();
+    for kv in query.split('&').filter(|kv| !kv.is_empty()) {
+        let (k, value) = kv.split_once('=').unwrap_or((kv, ""));
+        let index = match k {
+            "p" => 0,
+            "c" => 2,
+            "t" => 4,
+            "i" => 6,
+            "r" => 8,
+            _ => {
+                rest.push(kv);
+                continue;
+            }
+        };
+        let (a, b) = value.split_once('-').unwrap_or((value, value));
+        spider_y[index] = a.parse().unwrap_or(0);
+        spider_y[index + 1] = b.parse().unwrap_or(0);
+    }
+    let spider_x = if rest.is_empty() {
+        spider_path.to_owned()
+    } else {
+        format!("{spider_path}?{}", rest.join("&"))
+    };
+    let server_name = v["serverName"].as_str().unwrap_or_default();
+    Ok(crate::tls_client::Client {
+        server_name: if server_name.is_empty() {
+            default_name.to_owned()
+        } else {
+            server_name.to_owned()
+        },
+        fingerprint: fingerprint(&v["fingerprint"], path)?,
+        alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
+        reality: Some(crate::tls_client::Reality {
+            public_key,
+            short_id,
+            spider_x,
+            spider_y,
+        }),
+    })
+}
+
 fn parse_reality(v: &Value, path: &str) -> Result<crate::reality::Config> {
     keys(
         v,
@@ -524,6 +979,7 @@ pub enum OutboundKind {
         http: bool,
     },
     Socks(crate::socks::Server),
+    Vless(std::sync::Arc<crate::vless_out::Server>),
 }
 
 pub struct Outbound {
@@ -687,6 +1143,8 @@ impl Config {
                     "rawSettings",
                     "wsSettings",
                     "httpupgradeSettings",
+                    "xhttpSettings",
+                    "splithttpSettings",
                     "realitySettings",
                     "sockopt",
                 ],
@@ -717,13 +1175,24 @@ impl Config {
                     )?;
                     Transport::HttpUpgrade { path, host }
                 }
+                "xhttp" | "splithttp" => {
+                    let key = if stream["xhttpSettings"].is_null() {
+                        "splithttpSettings"
+                    } else {
+                        "xhttpSettings"
+                    };
+                    Transport::Xhttp(std::sync::Arc::new(crate::xhttp::Config::parse(
+                        &stream[key],
+                        &format!("{p}.streamSettings.{key}"),
+                    )?))
+                }
                 other => return Err(unsupported(&format!("{p}.streamSettings.network {other}"))),
             };
             let reality = match stream["security"].as_str().unwrap_or("none") {
                 "none" | "" => None,
                 "reality" => {
                     ensure!(
-                        matches!(transport, Transport::Raw),
+                        matches!(transport, Transport::Raw | Transport::Xhttp(_)),
                         "{}",
                         unsupported(&format!("{p}.streamSettings: REALITY over this network"))
                     );
@@ -865,31 +1334,44 @@ impl Config {
             let p = format!("outbounds[{i}]");
             keys(v, &["tag", "protocol", "settings", "streamSettings"], &p)?;
             let stream = &v["streamSettings"];
-            keys(
-                stream,
-                &["network", "security", "sockopt"],
-                &format!("{p}.streamSettings"),
-            )?;
+            let vless = v["protocol"] == "vless";
+            let allowed: &[&str] = if vless {
+                &[
+                    "network",
+                    "security",
+                    "sockopt",
+                    "tcpSettings",
+                    "rawSettings",
+                    "wsSettings",
+                    "tlsSettings",
+                    "realitySettings",
+                ]
+            } else {
+                &["network", "security", "sockopt"]
+            };
+            keys(stream, allowed, &format!("{p}.streamSettings"))?;
             for field in ["network", "security"] {
                 ensure!(
                     stream[field].is_null() || stream[field].is_string(),
                     "{p}.streamSettings.{field} must be a string"
                 );
             }
-            ensure!(
-                stream["network"]
-                    .as_str()
-                    .is_none_or(|n| matches!(n, "" | "raw" | "tcp")),
-                "{}",
-                unsupported(&format!("{p}.streamSettings.network"))
-            );
-            ensure!(
-                stream["security"]
-                    .as_str()
-                    .is_none_or(|s| matches!(s, "" | "none")),
-                "{}",
-                unsupported(&format!("{p}.streamSettings.security"))
-            );
+            if !vless {
+                ensure!(
+                    stream["network"]
+                        .as_str()
+                        .is_none_or(|n| matches!(n, "" | "raw" | "tcp")),
+                    "{}",
+                    unsupported(&format!("{p}.streamSettings.network"))
+                );
+                ensure!(
+                    stream["security"]
+                        .as_str()
+                        .is_none_or(|s| matches!(s, "" | "none")),
+                    "{}",
+                    unsupported(&format!("{p}.streamSettings.security"))
+                );
+            }
             let sockopt = &stream["sockopt"];
             let sp = format!("{p}.streamSettings.sockopt");
             keys(sockopt, &["interface", "tcpFastOpen"], &sp)?;
@@ -1001,6 +1483,9 @@ impl Config {
                         auth: (!user.is_empty()).then(|| (user.to_owned(), pass.to_owned())),
                     })
                 }
+                Some("vless") => OutboundKind::Vless(std::sync::Arc::new(parse_vless_outbound(
+                    settings, stream, &p,
+                )?)),
                 Some(other) => return Err(unsupported(&format!("{p}.protocol {other}"))),
                 None => bail!("{p}.protocol is required"),
             };
@@ -1208,6 +1693,38 @@ mod tests {
         ] {
             let parsed = Config::parse(&serde_json::json!({"log":log}).to_string()).unwrap();
             assert_eq!(parsed.access_log.as_deref(), expected);
+        }
+    }
+    #[test]
+    fn malformed_vless_outbound_fields_are_rejected() {
+        let base = serde_json::json!({"protocol":"vless","settings":{"address":"127.0.0.1","port":443,"id":"fuzz","encryption":"none"},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost"}}});
+        for (path, value) in [
+            ("/settings/flow", serde_json::json!(false)),
+            ("/settings/level", serde_json::json!(4294967296u64)),
+            (
+                "/streamSettings/tlsSettings/serverName",
+                serde_json::json!(false),
+            ),
+            (
+                "/streamSettings/tlsSettings/fingerprint",
+                serde_json::json!(17),
+            ),
+            (
+                "/streamSettings/tlsSettings/enableSessionResumption",
+                serde_json::json!("true"),
+            ),
+            (
+                "/streamSettings/tlsSettings/masterKeyLog",
+                serde_json::json!("/tmp/not-supported"),
+            ),
+        ] {
+            let mut outbound = base.clone();
+            let (parent, name) = path.rsplit_once('/').unwrap();
+            outbound.pointer_mut(parent).unwrap()[name] = value;
+            assert!(
+                Config::parse(&serde_json::json!({"outbounds":[outbound]}).to_string()).is_err(),
+                "accepted {path}"
+            );
         }
     }
 }

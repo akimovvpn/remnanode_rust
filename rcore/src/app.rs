@@ -275,6 +275,9 @@ impl Instance {
                         }
                     });
                 }
+                InboundKind::Vless(_) if matches!(inbound.transport, Transport::Xhttp(_)) => {
+                    tokio::spawn(crate::xhttp::serve(me, index, listener));
+                }
                 InboundKind::Vless(_) => {
                     tokio::spawn(async move {
                         loop {
@@ -309,8 +312,6 @@ impl Instance {
         let inbound = &self.config.inbounds[index];
         let local = stream.local_addr()?;
         stream.set_nodelay(true).ok();
-        let tag = &inbound.tag;
-        // The inbound counters wrap whatever the transport hands over (WS payload, not frames).
         let (io, peer, direct): (BoxIo, SocketAddr, Option<crate::tls13::DirectControl>) =
             match &inbound.transport {
                 Transport::Raw => match &inbound.reality {
@@ -339,7 +340,23 @@ impl Instance {
                         accept_httpupgrade(stream, path, host, &inbound.trusted_xff).await?;
                     (io, peer, None)
                 }
+                Transport::Xhttp(_) => bail!("XHTTP connections are served by xhttp::serve"),
             };
+        self.vless_conn(index, io, peer, local, direct).await
+    }
+
+    /// A VLESS connection over an established transport (raw/REALITY, WS, HTTPUpgrade, XHTTP).
+    pub(crate) async fn vless_conn(
+        self: Arc<Self>,
+        index: usize,
+        io: BoxIo,
+        peer: SocketAddr,
+        local: SocketAddr,
+        direct: Option<crate::tls13::DirectControl>,
+    ) -> Result<()> {
+        let inbound = &self.config.inbounds[index];
+        let tag = &inbound.tag;
+        // The inbound counters wrap whatever the transport hands over (WS payload, not frames).
         let mut conn = Counted::new(
             io,
             self.counter(
@@ -358,10 +375,14 @@ impl Instance {
             .clone();
         let handshake = self.config.policy.level(0).handshake;
         let (request, mut payload) =
-            tokio::time::timeout(handshake, vless::read_request(&mut conn, &users))
+            match tokio::time::timeout(handshake, vless::read_request(&mut conn, &users))
                 .await
                 .context("handshake timeout")?
-                .map_err(|e| e.context(format!("invalid request from {peer}")))?;
+            {
+                Ok(request) => request,
+                Err(error) if error.is::<vless::EmptyRequest>() => return Ok(()),
+                Err(error) => return Err(error.context(format!("invalid request from {peer}"))),
+            };
         vless::check_flow(&request, inbound.reality.is_some(), &payload)?;
         if request.flow == vless::XRV {
             let (io, decoded) = crate::vision::wrap(
@@ -511,7 +532,7 @@ impl Instance {
                 .await?;
                 match relay {
                     Some(socket) => {
-                        let socket = Datagram {
+                        let socket = Datagram::Socket {
                             socket,
                             socks: Some((dest, port)),
                         };
@@ -540,7 +561,7 @@ impl Instance {
                         let socket = udp_connect(addr, &outbound.socket).await?;
                         client
                             .relay_udp(
-                                Datagram {
+                                Datagram::Socket {
                                     socket,
                                     socks: None,
                                 },
@@ -568,6 +589,49 @@ impl Instance {
                             .await
                     }
                 }
+            }
+            OutboundKind::Vless(server) => {
+                // The VLESS outbound runs on its own user's policy.
+                let policy = self.config.policy.level(server.level);
+                let counters = (out_up, out_down);
+                if udp {
+                    let tunnel = tokio::time::timeout(
+                        policy.handshake,
+                        server.open_udp(&outbound.socket, &dest, port, counters),
+                    )
+                    .await
+                    .context("VLESS outbound handshake timeout")??;
+                    return client
+                        .relay_udp(Datagram::Vless(tunnel), &policy, None, None)
+                        .await;
+                }
+                let mut client = client;
+                let mut first = std::mem::take(&mut client.payload);
+                if !client.payload_counted
+                    && let Some(c) = &client.user_up
+                {
+                    c.add(first.len() as i64);
+                }
+                if first.is_empty() {
+                    // postRequest: wait up to 500 ms to send the first payload with the header.
+                    let mut buf = vec![0u8; 8192];
+                    if let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_millis(500), client.conn.read(&mut buf))
+                            .await
+                    {
+                        first.extend_from_slice(&buf[..n]);
+                        if let Some(c) = &client.user_up {
+                            c.add(n as i64);
+                        }
+                    }
+                }
+                let remote = tokio::time::timeout(
+                    policy.handshake,
+                    server.open_tcp(&outbound.socket, &dest, port, &first, counters),
+                )
+                .await
+                .context("VLESS outbound handshake timeout")??;
+                client.relay_tcp(remote, &policy).await
             }
         }
     }
@@ -634,6 +698,16 @@ impl Instance {
                     relay_packets(link, out, base, out_up, out_down).await
                 }
             },
+            OutboundKind::Vless(server) => {
+                let handshake = self.config.policy.level(server.level).handshake;
+                let tunnel = tokio::time::timeout(
+                    handshake,
+                    server.open_udp(&outbound.socket, &dest, port, (out_up, out_down)),
+                )
+                .await
+                .context("VLESS outbound handshake timeout")??;
+                relay_packets(link, PacketOut::Vless(tunnel), base, None, None).await
+            }
         }
     }
 
@@ -930,6 +1004,7 @@ enum PacketOut<'a> {
         dest: Address,
         port: u16,
     },
+    Vless(crate::vless_out::UdpTunnel),
 }
 
 impl PacketOut<'_> {
@@ -983,6 +1058,7 @@ impl PacketOut<'_> {
                 socket.send(&wire).await?;
                 Ok(wire.len())
             }
+            PacketOut::Vless(tunnel) => tunnel.send(&packet.data, packet.addr.as_ref()).await,
         }
     }
 
@@ -1023,6 +1099,7 @@ impl PacketOut<'_> {
                 };
                 Ok(Some((packet, wire)))
             }
+            PacketOut::Vless(tunnel) => tunnel.recv().await.map(Some),
         }
     }
 }
@@ -1141,67 +1218,98 @@ async fn udp_connect(addr: SocketAddr, options: &crate::socket::Options) -> Resu
     Ok(socket)
 }
 
-struct Datagram {
-    socket: UdpSocket,
-    socks: Option<(Address, u16)>,
+enum Datagram {
+    Socket {
+        socket: UdpSocket,
+        socks: Option<(Address, u16)>,
+    },
+    Vless(crate::vless_out::UdpTunnel),
 }
 
 impl Datagram {
     async fn send(&self, data: &[u8]) -> Result<usize> {
-        if let Some((dest, port)) = &self.socks {
-            let packet = crate::socks::udp_encode(dest, *port, data)?;
-            self.socket.send(&packet).await?;
-            Ok(packet.len())
-        } else {
-            Ok(self.socket.send(data).await?)
+        match self {
+            Datagram::Socket {
+                socket,
+                socks: Some((dest, port)),
+            } => {
+                let packet = crate::socks::udp_encode(dest, *port, data)?;
+                socket.send(&packet).await?;
+                Ok(packet.len())
+            }
+            Datagram::Socket { socket, .. } => Ok(socket.send(data).await?),
+            Datagram::Vless(tunnel) => tunnel.send(data, None).await,
         }
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<(usize, usize)> {
-        let wire = self.socket.recv(buf).await?;
-        if self.socks.is_some() {
-            let (_, _, payload) = crate::socks::udp_decode(&buf[..wire])?;
-            let n = payload.len();
-            buf.copy_within(wire - n..wire, 0);
-            Ok((n, wire))
-        } else {
-            Ok((wire, wire))
+        match self {
+            Datagram::Socket { socket, socks } => {
+                let wire = socket.recv(buf).await?;
+                if socks.is_some() {
+                    let (_, _, payload) = crate::socks::udp_decode(&buf[..wire])?;
+                    let n = payload.len();
+                    buf.copy_within(wire - n..wire, 0);
+                    Ok((n, wire))
+                } else {
+                    Ok((wire, wire))
+                }
+            }
+            Datagram::Vless(tunnel) => {
+                let (packet, wire) = tunnel.recv().await?;
+                let n = packet.data.len().min(buf.len());
+                buf[..n].copy_from_slice(&packet.data[..n]);
+                Ok((n, wire))
+            }
         }
     }
 }
 
 async fn connect(addrs: &[SocketAddr], options: &crate::socket::Options) -> Result<TcpStream> {
-    // retry.ExponentialBackoff(5, 100)
+    // retry.ExponentialBackoff(5, 100): despite the name it sleeps 0, 100, 200, 300, 400 ms.
     let mut last = None;
     for attempt in 0..5u32 {
-        for addr in addrs {
-            let socket = if addr.is_ipv4() {
-                tokio::net::TcpSocket::new_v4()
-            } else {
-                tokio::net::TcpSocket::new_v6()
-            };
-            let socket = match socket {
-                Ok(socket) => socket,
-                Err(error) => {
-                    last = Some(error.into());
-                    continue;
-                }
-            };
-            options.apply(&socket, true)?;
-            match tokio::time::timeout(Duration::from_secs(16), socket.connect(*addr)).await {
-                Ok(Ok(stream)) => return Ok(stream),
-                Ok(Err(e)) => last = Some(anyhow::Error::from(e)),
-                Err(_) => last = Some(anyhow::anyhow!("dial timeout")),
-            }
-        }
         if addrs.is_empty() {
             bail!("failed to resolve destination");
         }
-        tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+        match connect_once(addrs, options).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
     }
     Err(last
         .unwrap_or_else(|| anyhow::anyhow!("failed to dial"))
         .context("failed to open connection"))
+}
+
+/// One dial attempt over every resolved address (system dialer, 16 s timeout each).
+pub(crate) async fn connect_once(
+    addrs: &[SocketAddr],
+    options: &crate::socket::Options,
+) -> Result<TcpStream> {
+    let mut last = None;
+    for addr in addrs {
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        };
+        let socket = match socket {
+            Ok(socket) => socket,
+            Err(error) => {
+                last = Some(error.into());
+                continue;
+            }
+        };
+        options.apply(&socket, true)?;
+        match tokio::time::timeout(Duration::from_secs(16), socket.connect(*addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = Some(anyhow::Error::from(e)),
+            Err(_) => last = Some(anyhow::anyhow!("dial timeout")),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("failed to resolve destination")))
 }
 
 fn rand_below(n: u64) -> u64 {
@@ -1281,7 +1389,11 @@ impl Client {
         Ok(())
     }
 
-    async fn relay_tcp(mut self, remote: Counted<TcpStream>, policy: &LevelPolicy) -> Result<()> {
+    async fn relay_tcp<R: AsyncRead + AsyncWrite + Unpin>(
+        mut self,
+        remote: R,
+        policy: &LevelPolicy,
+    ) -> Result<()> {
         let activity = Activity::new(policy.conn_idle);
         let (mut remote_read, mut remote_write) = tokio::io::split(remote);
         let payload = std::mem::take(&mut self.payload);
@@ -1440,5 +1552,67 @@ impl<W: AsyncWrite + Unpin> Downlink<W> {
             let _ = self.inner.write_all(&RESPONSE_HEADER).await;
         }
         let _ = self.inner.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_vless_connection_closes_cleanly_but_partial_request_still_fails() {
+        let config = Config::parse(&serde_json::json!({"inbounds":[{"tag":"in","listen":"127.0.0.1","port":12345,"protocol":"vless","settings":{"decryption":"none","clients":[]}}]}).to_string()).unwrap();
+        let me = Instance::new(config).unwrap();
+        let peer: SocketAddr = "127.0.0.1:12346".parse().unwrap();
+        let (io, remote) = tokio::io::duplex(64);
+        drop(remote);
+        assert!(
+            me.clone()
+                .vless_conn(0, Box::new(io), peer, peer, None)
+                .await
+                .is_ok()
+        );
+        let (io, mut remote) = tokio::io::duplex(64);
+        remote.write_all(&[0]).await.unwrap();
+        drop(remote);
+        assert!(
+            me.vless_conn(0, Box::new(io), peer, peer, None)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn stalled_vless_outbound_uses_its_own_handshake_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stall = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let config = Config::parse(&serde_json::json!({
+            "policy":{"levels":{"7":{"handshake":1}}},
+            "inbounds":[{"tag":"in","port":12345,"protocol":"vless","settings":{"decryption":"none","clients":[{"id":"01010101010101010101010101010101"}]}}],
+            "outbounds":[{"protocol":"vless","settings":{"address":"127.0.0.1","port":port,"id":"fuzz","encryption":"none","level":7},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost"}}}]
+        }).to_string()).unwrap();
+        let me = Instance::new(config).unwrap();
+        let (io, mut remote) = tokio::io::duplex(128);
+        let mut request = vec![0];
+        request.extend_from_slice(&[1; 16]);
+        request.extend_from_slice(&[0, 1, 0, 80, 1, 127, 0, 0, 1]);
+        request.extend_from_slice(b"payload");
+        remote.write_all(&request).await.unwrap();
+        let peer = "127.0.0.1:12346".parse().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            me.vless_conn(0, Box::new(io), peer, peer, None),
+        )
+        .await
+        .expect("outbound handshake ignored its policy")
+        .expect_err("stalled handshake succeeded");
+        stall.abort();
+        assert!(
+            format!("{error:#}").contains("VLESS outbound handshake timeout"),
+            "{error:#}"
+        );
     }
 }

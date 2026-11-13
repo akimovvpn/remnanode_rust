@@ -93,7 +93,7 @@ fn parse_meta(b: &[u8]) -> Result<Meta> {
 }
 
 /// protocol.AddressParser with PortThenAddress (1 IPv4, 2 domain, 3 IPv6), as mux uses it.
-fn read_address_port(b: &[u8]) -> Result<(Address, u16, usize)> {
+pub(crate) fn read_address_port(b: &[u8]) -> Result<(Address, u16, usize)> {
     ensure!(b.len() >= 3, "unexpected EOF");
     let port = u16::from_be_bytes([b[0], b[1]]);
     let (address, end) = match b[2] {
@@ -137,7 +137,7 @@ fn parse_domain(raw: &[u8]) -> Result<Address> {
     Ok(Address::Domain(domain.into_owned()))
 }
 
-fn write_address_port(out: &mut Vec<u8>, address: &Address, port: u16) {
+pub(crate) fn write_address_port(out: &mut Vec<u8>, address: &Address, port: u16) {
     out.extend_from_slice(&port.to_be_bytes());
     match address {
         Address::Ip(IpAddr::V4(ip)) => {

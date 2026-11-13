@@ -60,6 +60,7 @@ fn echo(socket: Arc<UdpSocket>, also: Option<Arc<UdpSocket>>) {
 
 /// Echo, an unsolicited reply from another address (full cone, tagged with its source),
 /// a second destination on the same association and a large datagram.
+#[allow(dead_code)]
 pub async fn xudp_checks(socks: u16) -> Result<()> {
     let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -80,5 +81,66 @@ pub async fn xudp_checks(socks: u16) -> Result<()> {
         ensure!(port == a_port && data == [i; 100], "echo {i}");
         ensure!(reply(&udp).await?.1 == b"cone", "cone {i}");
     }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn socks_connect(socks: u16, target: u16) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(("127.0.0.1", socks)).await?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut greeting = [0; 2];
+    stream.read_exact(&mut greeting).await?;
+    ensure!(greeting == [5, 0], "SOCKS greeting: {greeting:?}");
+    let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+    request.extend_from_slice(&target.to_be_bytes());
+    stream.write_all(&request).await?;
+    let mut reply = [0; 10];
+    stream.read_exact(&mut reply).await?;
+    ensure!(reply[1] == 0, "SOCKS connect reply: {reply:?}");
+    Ok(stream)
+}
+
+/// TCP echo through SOCKS: several round trips, then 4 MB both ways at once. The write half
+/// stays open until the echo is read back (mux.cool has no half-close).
+#[allow(dead_code)]
+pub async fn tcp_checks(socks: u16) -> Result<()> {
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = echo.local_addr()?.port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n) = s.read(&mut buf).await
+                    && n > 0
+                {
+                    if s.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let mut s = socks_connect(socks, port).await?;
+    for message in [&b"ping"[..], b"second message", &[7u8; 3000]] {
+        s.write_all(message).await?;
+        let mut back = vec![0u8; message.len()];
+        tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut back))
+            .await
+            .context("echo timeout")??;
+        ensure!(back == message, "echo mismatch");
+    }
+    let big: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();
+    let (mut r, mut w) = s.into_split();
+    let sent = big.clone();
+    let writer = tokio::spawn(async move {
+        w.write_all(&sent).await?;
+        anyhow::Ok(w)
+    });
+    let mut got = vec![0u8; big.len()];
+    tokio::time::timeout(Duration::from_secs(30), r.read_exact(&mut got))
+        .await
+        .context("large transfer timeout")??;
+    writer.await??;
+    ensure!(got == big, "large transfer corrupted");
     Ok(())
 }

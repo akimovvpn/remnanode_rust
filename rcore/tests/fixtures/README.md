@@ -34,3 +34,17 @@ different public keys in its hybrid and standalone shares.
 
 Do not use the older uTLS version in a developer's Go module cache as the
 reference for this release.
+
+## Outbound fingerprints
+
+`clienthello-firefox.bin` is the `HelloFirefox_Auto` ClientHello the same
+Xray 26.11.9 binary sends as a VLESS REALITY client with `"fingerprint":
+"firefox"` and server name `probe.example`, captured at a loopback TCP socket.
+Its key shares are X25519MLKEM768, X25519 (the same X25519 key as inside the
+hybrid share) and P-256; the extension order is fixed and its ECH GREASE has a
+239-byte payload with AES-128-GCM or ChaCha20-Poly1305. The outbound client also
+uses `clienthello-chrome155.bin` for `chrome`; captures of the live client showed
+per-connection GREASE values, shuffled extensions and ECH GREASE payloads of
+144/176/208 (from 128..224 + 16) bytes, which `tls_client.rs` reproduces.
+A configured `alpn` replaces the ALPN extension, and the WebSocket dialer
+always offers `http/1.1` only.

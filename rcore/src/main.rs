@@ -1,7 +1,10 @@
 //! rcore: Rust port of the Xray-core subset Remnawave Node drives, with Xray's CLI and config format.
 mod api;
 mod app;
+mod browser;
 mod config;
+#[cfg(test)]
+mod fuzz;
 mod geodata;
 mod mux;
 mod reality;
@@ -13,9 +16,12 @@ mod socket;
 mod socks;
 mod stats;
 mod tls13;
+mod tls_client;
 mod transport;
 mod vision;
 mod vless;
+mod vless_out;
+mod xhttp;
 
 use anyhow::{Context, Result};
 use std::process::ExitCode;

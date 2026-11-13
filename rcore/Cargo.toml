@@ -37,12 +37,18 @@ tower = { version = "0.5", features = ["util"] }
 http = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+bytes = "1"
+flate2 = "1"
+zstd = "0.14"
+x509-parser = "0.18"
 http-body-util = "0.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3"
 remnanode-rust = { path = ".." }
+bolero = "0.13"

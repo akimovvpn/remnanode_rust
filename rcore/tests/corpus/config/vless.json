@@ -1,0 +1,1 @@
+{"inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": 12345, "protocol": "vless", "settings": {"decryption": "none", "clients": [{"id": "fuzz", "flow": "xtls-rprx-vision"}]}}]}

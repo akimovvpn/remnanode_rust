@@ -1,0 +1,1 @@
+{"inbounds": [{"tag": "in", "port": 12345, "protocol": "vless", "settings": {"decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/test", "mode": "packet-up", "extra": {"scMaxEachPostBytes": 10000, "sessionPlacement": "header"}}}}]}

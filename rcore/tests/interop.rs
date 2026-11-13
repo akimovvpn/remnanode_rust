@@ -145,9 +145,15 @@ async fn with_mux(
     let http_port = http.local_addr().unwrap().port();
     tokio::spawn(async move {
         let (mut s, _) = http.accept().await.unwrap();
+        // TCP may deliver the request in pieces; read up to the end of the headers.
+        let mut request = Vec::new();
         let mut buf = [0u8; 1024];
-        let n = s.read(&mut buf).await.unwrap();
-        assert!(buf[..n].starts_with(b"GET /x HTTP/1.1"));
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(n > 0, "request ended early: {request:?}");
+            request.extend_from_slice(&buf[..n]);
+        }
+        assert!(request.starts_with(b"GET /x HTTP/1.1"), "{request:?}");
         s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
             .await
             .unwrap();
@@ -169,6 +175,31 @@ async fn with_mux(
 
     // UDP to ports other than 53/443 travels as XUDP (mux.cool) even without mux enabled.
     common::xudp_checks(socks_port).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_packet_up_with_header_uplink_and_obfuscated_padding() {
+    // The options of a real Remnawave profile: GET uploads carried in X-Data-N headers.
+    let settings = json!({"network": "xhttp", "xhttpSettings": {"mode": "packet-up", "path": "/files/download/",
+        "extra": {"xmux": {"cMaxReuseTimes": 0, "maxConcurrency": "8-16"}, "seqKey": "id", "headers": {"X-Code": "x"},
+            "xPaddingBytes": "50-80", "xPaddingObfsMode": true, "uplinkHTTPMethod": "GET",
+            "uplinkDataPlacement": "header", "scMaxEachPostBytes": 3000, "scMinPostsIntervalMs": 1}}});
+    go_client_talks_to_rcore(settings.clone(), settings).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_packet_up_default_body_uplink() {
+    let settings = json!({"network": "xhttp", "xhttpSettings": {"path": "/x"}});
+    go_client_talks_to_rcore(settings.clone(), settings).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_tokenish_cookie_padding_and_query_placements() {
+    let settings = json!({"network": "xhttp", "xhttpSettings": {"mode": "packet-up", "path": "/q", "extra": {
+        "xPaddingObfsMode": true, "xPaddingMethod": "tokenish", "xPaddingPlacement": "cookie",
+        "sessionIDPlacement": "query", "seqPlacement": "header", "uplinkDataPlacement": "cookie",
+        "scMaxEachPostBytes": 2000, "scMinPostsIntervalMs": 1}}});
+    go_client_talks_to_rcore(settings.clone(), settings).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
