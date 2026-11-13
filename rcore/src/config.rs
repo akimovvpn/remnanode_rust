@@ -1635,7 +1635,13 @@ mod tests {
             .to_string();
         assert!(error.contains("security xtls"), "{error}");
         let h3 = r#"{"inbounds":[{"port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}}]}"#;
-        assert!(Config::parse(h3).err().unwrap().to_string().contains("HTTP/3"));
+        assert!(
+            Config::parse(h3)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("HTTP/3")
+        );
         assert!(Config::parse(r#"{"dns":{"servers":["1.1.1.1"],"script":"x"}}"#).is_err());
         assert!(Config::parse(r#"{"dns":{"servers":["fakedns"]}}"#).is_err());
         assert!(Config::parse(r#"{"outbounds":[{"protocol":"vmess"}]}"#).is_err());

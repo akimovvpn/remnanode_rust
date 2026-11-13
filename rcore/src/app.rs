@@ -421,7 +421,12 @@ impl Instance {
         stream.set_nodelay(true).ok();
         let handshake = self.config.policy.level(0).handshake;
         // (stream, client address, Vision's switch, outer TLS version when VLESS runs on it).
-        type Accepted = (BoxIo, SocketAddr, Option<crate::tls13::DirectControl>, Option<u16>);
+        type Accepted = (
+            BoxIo,
+            SocketAddr,
+            Option<crate::tls13::DirectControl>,
+            Option<u16>,
+        );
         let accepted: Result<Accepted> = async {
             if let Some(tls) = &inbound.tls {
                 let http_hub = !matches!(inbound.transport, Transport::Raw);

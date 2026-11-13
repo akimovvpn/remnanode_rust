@@ -91,7 +91,10 @@ fn file_or_string(file: &str, lines: &[String]) -> Result<Vec<u8>> {
     if !file.is_empty() {
         return std::fs::read(cert_path(file)).with_context(|| format!("open {file}"));
     }
-    ensure!(!lines.is_empty(), "infra/conf: both file and bytes are empty.");
+    ensure!(
+        !lines.is_empty(),
+        "infra/conf: both file and bytes are empty."
+    );
     Ok(lines.join("\n").into_bytes())
 }
 
@@ -118,7 +121,10 @@ fn key_pair(cert: &[u8], key: &[u8]) -> Result<Pair> {
     let chain: Vec<_> = rustls_pemfile::certs(&mut &cert[..])
         .collect::<Result<_, _>>()
         .context("tls: failed to find any PEM data in certificate input")?;
-    ensure!(!chain.is_empty(), "tls: failed to find any PEM data in certificate input");
+    ensure!(
+        !chain.is_empty(),
+        "tls: failed to find any PEM data in certificate input"
+    );
     let der = rustls_pemfile::private_key(&mut &key[..])
         .ok()
         .flatten()
@@ -129,8 +135,8 @@ fn key_pair(cert: &[u8], key: &[u8]) -> Result<Pair> {
     certified
         .keys_match()
         .map_err(|_| anyhow::anyhow!("tls: private key does not match public key"))?;
-    let (_, leaf) = x509_parser::parse_x509_certificate(&chain[0])
-        .map_err(|e| anyhow::anyhow!("x509: {e}"))?;
+    let (_, leaf) =
+        x509_parser::parse_x509_certificate(&chain[0]).map_err(|e| anyhow::anyhow!("x509: {e}"))?;
     let common_name = leaf
         .subject()
         .iter_common_name()
@@ -168,7 +174,9 @@ const MLKEM768_EK: usize = 1184;
 
 impl SupportedKxGroup for X25519MlKem768 {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
-        Err(rustls::Error::General("X25519MLKEM768 is server-only here".into()))
+        Err(rustls::Error::General(
+            "X25519MLKEM768 is server-only here".into(),
+        ))
     }
 
     fn start_and_complete(&self, share: &[u8]) -> Result<CompletedKeyExchange, rustls::Error> {
@@ -213,11 +221,13 @@ static X25519_MLKEM768: X25519MlKem768 = X25519MlKem768;
 
 /// crypto/tls cipher suite IDs, and those that are AES-GCM (isAESGCMPreferred).
 const GO_SUITES: &[u16] = &[
-    0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc009, 0xc013,
-    0xc00a, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035, 0xc012, 0x000a, 0xc023, 0xc027, 0x003c,
-    0xc007, 0xc011, 0x0005,
+    0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc009, 0xc013, 0xc00a,
+    0xc014, 0x009c, 0x009d, 0x002f, 0x0035, 0xc012, 0x000a, 0xc023, 0xc027, 0x003c, 0xc007, 0xc011,
+    0x0005,
 ];
-const AES_GCM: &[u16] = &[0x1301, 0x1302, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0x009c, 0x009d];
+const AES_GCM: &[u16] = &[
+    0x1301, 0x1302, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0x009c, 0x009d,
+];
 
 /// isAESGCMPreferred (assuming AES hardware, as on the servers rcore targets).
 fn aes_preferred(suites: &[CipherSuite]) -> bool {
@@ -300,7 +310,10 @@ async fn read_record(tcp: &mut TcpStream) -> io::Result<Vec<u8>> {
     tcp.read_exact(&mut record).await?;
     let len = u16::from_be_bytes([record[3], record[4]]) as usize;
     if len > 16384 + 2048 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "tls: oversized record received"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tls: oversized record received",
+        ));
     }
     record.resize(5 + len, 0);
     tcp.read_exact(&mut record[5..]).await?;
@@ -309,20 +322,71 @@ async fn read_record(tcp: &mut TcpStream) -> io::Result<Vec<u8>> {
 
 /// Go's fingerprint names (tls.GetFingerprint), which the server config still validates.
 const FINGERPRINTS: &[&str] = &[
-    "", "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random",
-    "randomized", "randomizednoalpn", "unsafe", "hellofirefox_120", "hellofirefox_148",
-    "hellochrome_120", "hellochrome_131", "hellochrome_133", "hellochrome_155", "helloios_13",
-    "helloios_14", "helloedge_106", "hellosafari_26_3", "hello360_11_0", "helloqq_11_1",
-    "hellogolang", "hellorandomized", "hellorandomizedalpn", "hellorandomizednoalpn",
-    "hellofirefox_auto", "hellofirefox_55", "hellofirefox_56", "hellofirefox_63",
-    "hellofirefox_65", "hellofirefox_99", "hellofirefox_102", "hellofirefox_105",
-    "hellochrome_auto", "hellochrome_58", "hellochrome_62", "hellochrome_70", "hellochrome_72",
-    "hellochrome_83", "hellochrome_87", "hellochrome_96", "hellochrome_100", "hellochrome_102",
-    "hellochrome_106_shuffle", "helloios_auto", "helloios_11_1", "helloios_12_1",
-    "helloandroid_11_okhttp", "helloedge_85", "helloedge_auto", "hellosafari_16_0",
-    "hellosafari_auto", "hello360_auto", "hello360_7_5", "helloqq_auto", "hellochrome_100_psk",
-    "hellochrome_112_psk_shuf", "hellochrome_114_padding_psk_shuf", "hellochrome_115_pq",
-    "hellochrome_115_pq_psk", "hellochrome_120_pq",
+    "",
+    "chrome",
+    "firefox",
+    "safari",
+    "ios",
+    "android",
+    "edge",
+    "360",
+    "qq",
+    "random",
+    "randomized",
+    "randomizednoalpn",
+    "unsafe",
+    "hellofirefox_120",
+    "hellofirefox_148",
+    "hellochrome_120",
+    "hellochrome_131",
+    "hellochrome_133",
+    "hellochrome_155",
+    "helloios_13",
+    "helloios_14",
+    "helloedge_106",
+    "hellosafari_26_3",
+    "hello360_11_0",
+    "helloqq_11_1",
+    "hellogolang",
+    "hellorandomized",
+    "hellorandomizedalpn",
+    "hellorandomizednoalpn",
+    "hellofirefox_auto",
+    "hellofirefox_55",
+    "hellofirefox_56",
+    "hellofirefox_63",
+    "hellofirefox_65",
+    "hellofirefox_99",
+    "hellofirefox_102",
+    "hellofirefox_105",
+    "hellochrome_auto",
+    "hellochrome_58",
+    "hellochrome_62",
+    "hellochrome_70",
+    "hellochrome_72",
+    "hellochrome_83",
+    "hellochrome_87",
+    "hellochrome_96",
+    "hellochrome_100",
+    "hellochrome_102",
+    "hellochrome_106_shuffle",
+    "helloios_auto",
+    "helloios_11_1",
+    "helloios_12_1",
+    "helloandroid_11_okhttp",
+    "helloedge_85",
+    "helloedge_auto",
+    "hellosafari_16_0",
+    "hellosafari_auto",
+    "hello360_auto",
+    "hello360_7_5",
+    "helloqq_auto",
+    "hellochrome_100_psk",
+    "hellochrome_112_psk_shuf",
+    "hellochrome_114_padding_psk_shuf",
+    "hellochrome_115_pq",
+    "hellochrome_115_pq_psk",
+    "hellochrome_120_pq",
 ];
 
 impl Server {
@@ -386,7 +450,10 @@ impl Server {
                 pin.len() % 2 == 0 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
                 "encoding/hex: invalid byte in {pin}"
             );
-            ensure!(pin.len() == 64, "incorrect pinnedPeerCertSha256 length: {pin}");
+            ensure!(
+                pin.len() == 64,
+                "incorrect pinnedPeerCertSha256 length: {pin}"
+            );
         }
         ensure!(
             text("echServerKeys")?.is_empty(),
@@ -394,7 +461,12 @@ impl Server {
             unsupported(&format!("{path}.echServerKeys"))
         );
         let mut entries = Vec::new();
-        for (i, c) in v["certificates"].as_array().into_iter().flatten().enumerate() {
+        for (i, c) in v["certificates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
             let p = format!("{path}.certificates[{i}]");
             keys(
                 c,
@@ -469,7 +541,11 @@ impl Server {
             "1.2" => 0x0303,
             _ => 0x0304,
         };
-        let min = if text("minVersion")? == "1.3" { 0x0304 } else { 0x0303 };
+        let min = if text("minVersion")? == "1.3" {
+            0x0304
+        } else {
+            0x0303
+        };
         let versions: Vec<&'static rustls::SupportedProtocolVersion> = [
             (0x0304, &rustls::version::TLS13),
             (0x0303, &rustls::version::TLS12),
@@ -478,17 +554,38 @@ impl Server {
         .filter(|(v, _)| (min..=max).contains(v))
         .map(|(_, v)| v)
         .collect();
-        ensure!(!versions.is_empty(), "tls: no supported versions satisfy MinVersion and MaxVersion");
+        ensure!(
+            !versions.is_empty(),
+            "tls: no supported versions satisfy MinVersion and MaxVersion"
+        );
         // CipherSuites only narrows TLS 1.2 in Go (its order is ignored); CBC and RSA-kex
         // suites have no rustls counterpart.
         use provider::cipher_suite as cs;
         let tls12_names: [(&str, SupportedCipherSuite); 6] = [
-            ("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", cs::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
-            ("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", cs::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
-            ("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", cs::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384),
-            ("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", cs::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
-            ("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", cs::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256),
-            ("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", cs::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256),
+            (
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                cs::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ),
+            (
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                cs::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ),
+            (
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                cs::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ),
+            (
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                cs::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ),
+            (
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                cs::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            ),
+            (
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                cs::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ),
         ];
         let configured: Vec<String> = text("cipherSuites")?
             .split(':')
@@ -502,7 +599,9 @@ impl Server {
                     && !tls12_names.iter().any(|(m, _)| m == n)
                     && !matches!(
                         n.as_str(),
-                        "TLS_AES_128_GCM_SHA256" | "TLS_AES_256_GCM_SHA384" | "TLS_CHACHA20_POLY1305_SHA256"
+                        "TLS_AES_128_GCM_SHA256"
+                            | "TLS_AES_256_GCM_SHA384"
+                            | "TLS_CHACHA20_POLY1305_SHA256"
                     )
                 {
                     warnings.push(format!(
@@ -526,9 +625,17 @@ impl Server {
                 .map(|(_, s)| s)
                 .collect()
         };
-        let mut aes_suites = vec![cs::TLS13_AES_128_GCM_SHA256, cs::TLS13_AES_256_GCM_SHA384, cs::TLS13_CHACHA20_POLY1305_SHA256];
+        let mut aes_suites = vec![
+            cs::TLS13_AES_128_GCM_SHA256,
+            cs::TLS13_AES_256_GCM_SHA384,
+            cs::TLS13_CHACHA20_POLY1305_SHA256,
+        ];
         aes_suites.extend(tls12(&[0, 1, 2, 3, 4, 5]));
-        let mut chacha_suites = vec![cs::TLS13_CHACHA20_POLY1305_SHA256, cs::TLS13_AES_128_GCM_SHA256, cs::TLS13_AES_256_GCM_SHA384];
+        let mut chacha_suites = vec![
+            cs::TLS13_CHACHA20_POLY1305_SHA256,
+            cs::TLS13_AES_128_GCM_SHA256,
+            cs::TLS13_AES_256_GCM_SHA384,
+        ];
         chacha_suites.extend(tls12(&[4, 5, 0, 1, 2, 3]));
         // Go 1.26 curve order; SecP256r1MLKEM768, SecP384r1MLKEM1024 and P-521 are not in ring.
         let all_groups: [(&str, &'static dyn SupportedKxGroup); 4] = [
@@ -543,7 +650,10 @@ impl Server {
         } else {
             let mut groups = Vec::new();
             for name in &curves {
-                match all_groups.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                match all_groups
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
                     Some((_, g)) => groups.push(*g),
                     None if matches!(
                         name.to_lowercase().as_str(),
@@ -656,7 +766,9 @@ impl Server {
             let cert = match std::fs::read(cert_path(&e.cert_path)) {
                 Ok(c) => c,
                 Err(error) => {
-                    tracing::error!("transport/internet/tls: failed to parse certificate > {error}");
+                    tracing::error!(
+                        "transport/internet/tls: failed to parse certificate > {error}"
+                    );
                     return false;
                 }
             };
@@ -729,7 +841,10 @@ impl Server {
             if first && record[0] != 22 {
                 // net/http answers an HTTP request on its TLS listener before closing.
                 if http_hub
-                    && matches!(&record[..5], b"GET /" | b"HEAD " | b"POST " | b"PUT /" | b"OPTIO")
+                    && matches!(
+                        &record[..5],
+                        b"GET /" | b"HEAD " | b"POST " | b"PUT /" | b"OPTIO"
+                    )
                 {
                     let _ = tcp
                         .write_all(b"HTTP/1.0 400 Bad Request\r\n\r\nClient sent an HTTP request to an HTTPS server.\n")
@@ -751,7 +866,9 @@ impl Server {
             }
         };
         let hello = accepted.client_hello();
-        let client_alpn = hello.alpn().map(|a| a.map(<[u8]>::to_vec).collect::<Vec<_>>());
+        let client_alpn = hello
+            .alpn()
+            .map(|a| a.map(<[u8]>::to_vec).collect::<Vec<_>>());
         let alpn = match negotiate_alpn(&self.alpn, client_alpn) {
             Ok(alpn) => alpn,
             Err(error) => {
@@ -871,7 +988,10 @@ mod tests {
     fn alpn_follows_go_negotiation() {
         let server = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let ask = |c: &[&str]| {
-            negotiate_alpn(&server, Some(c.iter().map(|s| s.as_bytes().to_vec()).collect()))
+            negotiate_alpn(
+                &server,
+                Some(c.iter().map(|s| s.as_bytes().to_vec()).collect()),
+            )
         };
         assert_eq!(ask(&["http/1.1", "h2"]).unwrap(), Some(b"h2".to_vec()));
         assert_eq!(ask(&["http/1.1"]).unwrap(), Some(b"http/1.1".to_vec()));
@@ -894,17 +1014,35 @@ mod tests {
 
     /// A self-signed certificate for `name` in `dir` as (cert path, key path).
     fn self_signed(dir: &Path, name: &str) -> (String, String) {
-        let (cert, key) = (dir.join(format!("{name}.pem")), dir.join(format!("{name}.key")));
+        let (cert, key) = (
+            dir.join(format!("{name}.pem")),
+            dir.join(format!("{name}.key")),
+        );
         let status = std::process::Command::new("openssl")
-            .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                   "-nodes", "-days", "2", "-subj", &format!("/CN={name}")])
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-days",
+                "2",
+                "-subj",
+                &format!("/CN={name}"),
+            ])
             .arg("-keyout")
             .arg(&key)
             .arg("-out")
             .arg(&cert)
             .output()
             .expect("openssl");
-        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
         (cert.display().to_string(), key.display().to_string())
     }
 

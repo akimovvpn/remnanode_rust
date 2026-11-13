@@ -57,16 +57,42 @@ async fn openssl(args: &[&str], dir: &Path) -> Result<()> {
 
 /// A CA, and leaf certificates `name.pem`/`name.key` for each (name, SAN DNS name).
 async fn certificates(dir: &Path, leaves: &[(&str, &str)]) -> Result<()> {
-    openssl(&["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", "ca.key"], dir).await?;
     openssl(
-        &["req", "-x509", "-new", "-key", "ca.key", "-days", "2", "-subj", "/CN=rcore test CA", "-out", "ca.pem"],
+        &[
+            "ecparam",
+            "-name",
+            "prime256v1",
+            "-genkey",
+            "-noout",
+            "-out",
+            "ca.key",
+        ],
+        dir,
+    )
+    .await?;
+    openssl(
+        &[
+            "req",
+            "-x509",
+            "-new",
+            "-key",
+            "ca.key",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=rcore test CA",
+            "-out",
+            "ca.pem",
+        ],
         dir,
     )
     .await?;
     for (name, dns) in leaves {
         std::fs::write(
             dir.join(format!("{name}.ext")),
-            format!("basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:{dns}\n"),
+            format!(
+                "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:{dns}\n"
+            ),
         )?;
         let (key, csr, pem, ext) = (
             format!("{name}.key"),
@@ -74,11 +100,51 @@ async fn certificates(dir: &Path, leaves: &[(&str, &str)]) -> Result<()> {
             format!("{name}.pem"),
             format!("{name}.ext"),
         );
-        openssl(&["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", &key], dir).await?;
-        openssl(&["req", "-new", "-key", &key, "-subj", &format!("/CN={dns}"), "-out", &csr], dir).await?;
         openssl(
-            &["x509", "-req", "-in", &csr, "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
-              "-days", "2", "-extfile", &ext, "-out", &pem],
+            &[
+                "ecparam",
+                "-name",
+                "prime256v1",
+                "-genkey",
+                "-noout",
+                "-out",
+                &key,
+            ],
+            dir,
+        )
+        .await?;
+        openssl(
+            &[
+                "req",
+                "-new",
+                "-key",
+                &key,
+                "-subj",
+                &format!("/CN={dns}"),
+                "-out",
+                &csr,
+            ],
+            dir,
+        )
+        .await?;
+        openssl(
+            &[
+                "x509",
+                "-req",
+                "-in",
+                &csr,
+                "-CA",
+                "ca.pem",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-days",
+                "2",
+                "-extfile",
+                &ext,
+                "-out",
+                &pem,
+            ],
             dir,
         )
         .await?;
@@ -98,14 +164,70 @@ struct Case {
 fn cases() -> Vec<Case> {
     let none = json!({});
     vec![
-        Case { name: "raw-chrome", network: "raw", settings: none.clone(), flow: "", fingerprint: "chrome", client_tls: json!({}) },
-        Case { name: "raw-vision-firefox", network: "raw", settings: none.clone(), flow: FLOW, fingerprint: "firefox", client_tls: json!({}) },
-        Case { name: "raw-vision-chrome", network: "raw", settings: none.clone(), flow: FLOW, fingerprint: "chrome", client_tls: json!({}) },
-        Case { name: "ws", network: "ws", settings: json!({"wsSettings": {"path": "/ws"}}), flow: "", fingerprint: "chrome", client_tls: json!({}) },
-        Case { name: "httpupgrade", network: "httpupgrade", settings: json!({"httpupgradeSettings": {"path": "/up"}}), flow: "", fingerprint: "chrome", client_tls: json!({}) },
-        Case { name: "xhttp-h2", network: "xhttp", settings: json!({"xhttpSettings": {"path": "/x", "mode": "stream-one"}}), flow: "", fingerprint: "chrome", client_tls: json!({}) },
-        Case { name: "xhttp-http11", network: "xhttp", settings: json!({"xhttpSettings": {"path": "/x", "mode": "packet-up"}}), flow: "", fingerprint: "chrome", client_tls: json!({"alpn": ["http/1.1"]}) },
-        Case { name: "raw-tls12", network: "raw", settings: none, flow: "", fingerprint: "unsafe", client_tls: json!({"maxVersion": "1.2"}) },
+        Case {
+            name: "raw-chrome",
+            network: "raw",
+            settings: none.clone(),
+            flow: "",
+            fingerprint: "chrome",
+            client_tls: json!({}),
+        },
+        Case {
+            name: "raw-vision-firefox",
+            network: "raw",
+            settings: none.clone(),
+            flow: FLOW,
+            fingerprint: "firefox",
+            client_tls: json!({}),
+        },
+        Case {
+            name: "raw-vision-chrome",
+            network: "raw",
+            settings: none.clone(),
+            flow: FLOW,
+            fingerprint: "chrome",
+            client_tls: json!({}),
+        },
+        Case {
+            name: "ws",
+            network: "ws",
+            settings: json!({"wsSettings": {"path": "/ws"}}),
+            flow: "",
+            fingerprint: "chrome",
+            client_tls: json!({}),
+        },
+        Case {
+            name: "httpupgrade",
+            network: "httpupgrade",
+            settings: json!({"httpupgradeSettings": {"path": "/up"}}),
+            flow: "",
+            fingerprint: "chrome",
+            client_tls: json!({}),
+        },
+        Case {
+            name: "xhttp-h2",
+            network: "xhttp",
+            settings: json!({"xhttpSettings": {"path": "/x", "mode": "stream-one"}}),
+            flow: "",
+            fingerprint: "chrome",
+            client_tls: json!({}),
+        },
+        Case {
+            name: "xhttp-http11",
+            network: "xhttp",
+            settings: json!({"xhttpSettings": {"path": "/x", "mode": "packet-up"}}),
+            flow: "",
+            fingerprint: "chrome",
+            client_tls: json!({"alpn": ["http/1.1"]}),
+        },
+        Case {
+            name: "raw-tls12",
+            network: "raw",
+            settings: none,
+            flow: "",
+            fingerprint: "unsafe",
+            client_tls: json!({"maxVersion": "1.2"}),
+        },
     ]
 }
 
@@ -138,8 +260,14 @@ async fn setup(dir: &Path, xray: &str, case: &Case) -> Result<(Vec<Child>, u16)>
         "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": true, "ip": "127.0.0.1"}}],
         "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": rcore_port,
             "users": [{"id": ID, "encryption": "none", "flow": case.flow}]}]}, "streamSettings": client_stream}]});
-    std::fs::write(dir.join(format!("{}-rcore.json", case.name)), rcore.to_string())?;
-    std::fs::write(dir.join(format!("{}-client.json", case.name)), client.to_string())?;
+    std::fs::write(
+        dir.join(format!("{}-rcore.json", case.name)),
+        rcore.to_string(),
+    )?;
+    std::fs::write(
+        dir.join(format!("{}-client.json", case.name)),
+        client.to_string(),
+    )?;
     let rcore = spawn_logged(
         Command::new(env!("CARGO_BIN_EXE_rcore"))
             .args(["run", "-config", &format!("{}-rcore.json", case.name)])
@@ -163,9 +291,10 @@ async fn setup(dir: &Path, xray: &str, case: &Case) -> Result<(Vec<Child>, u16)>
 async fn inner_tls(dir: &Path, socks: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let chain: Vec<_> =
-        rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(dir.join("leaf.pem"))?))
-            .collect::<Result<_, _>>()?;
+    let chain: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
+        dir.join("leaf.pem"),
+    )?))
+    .collect::<Result<_, _>>()?;
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(
         dir.join("leaf.key"),
     )?))?
@@ -188,7 +317,9 @@ async fn inner_tls(dir: &Path, socks: u16) -> Result<()> {
         }
     });
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(dir.join("ca.pem"))?)) {
+    for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
+        dir.join("ca.pem"),
+    )?)) {
         roots.add(cert?)?;
     }
     let config = rustls::ClientConfig::builder_with_provider(provider)
@@ -222,7 +353,9 @@ fn workdir() -> Result<tempfile::TempDir> {
     match std::env::var_os("RCORE_TEST_DIR") {
         Some(base) => {
             std::fs::create_dir_all(&base)?;
-            Ok(tempfile::Builder::new().disable_cleanup(true).tempdir_in(base)?)
+            Ok(tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir_in(base)?)
         }
         None => Ok(tempfile::tempdir()?),
     }
@@ -240,15 +373,24 @@ async fn go_clients_over_tls_inbound() -> Result<()> {
             let (_children, socks) = setup(dir.path(), &xray, &case).await?;
             common::tcp_checks(socks).await.context("TCP")?;
             if case.flow == FLOW {
-                inner_tls(dir.path(), socks).await.context("Vision inner TLS")?;
+                inner_tls(dir.path(), socks)
+                    .await
+                    .context("Vision inner TLS")?;
             }
             if !case.name.starts_with("xhttp") {
                 common::xudp_checks(socks).await.context("UDP")?;
             }
             // masterKeyLog in NSS format, as crypto/tls's KeyLogWriter writes it.
             let keys = std::fs::read_to_string(dir.path().join(format!("{}-keys.log", case.name)))?;
-            let label = if case.name.ends_with("tls12") { "CLIENT_RANDOM " } else { "SERVER_TRAFFIC_SECRET_0 " };
-            ensure!(keys.lines().any(|l| l.starts_with(label)), "key log: {keys}");
+            let label = if case.name.ends_with("tls12") {
+                "CLIENT_RANDOM "
+            } else {
+                "SERVER_TRAFFIC_SECRET_0 "
+            };
+            ensure!(
+                keys.lines().any(|l| l.starts_with(label)),
+                "key log: {keys}"
+            );
             Result::<()>::Ok(())
         })
         .await
@@ -299,7 +441,9 @@ async fn vision_refuses_outer_tls12_like_go() -> Result<()> {
 /// Which alert (if any) a TLS 1.3 client gets for `sni` from a server on `port`.
 async fn handshake_alert(port: u16, sni: &str, dir: &Path) -> Result<Option<String>> {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(dir.join("ca.pem"))?)) {
+    for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
+        dir.join("ca.pem"),
+    )?)) {
         roots.add(cert?)?;
     }
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -341,7 +485,10 @@ async fn certificate_selection_and_unknown_sni_match_go() -> Result<()> {
             "streamSettings": {"network": "raw", "security": "tls",
                 "tlsSettings": {"certificates": certs, "rejectUnknownSni": true}}}],
             "outbounds": [{"protocol": "freedom"}]});
-        std::fs::write(dir.path().join(format!("{name}-sni.json")), config.to_string())?;
+        std::fs::write(
+            dir.path().join(format!("{name}-sni.json")),
+            config.to_string(),
+        )?;
         let _child = spawn_logged(
             Command::new(binary)
                 .args(["run", "-config", &format!("{name}-sni.json")])
@@ -354,9 +501,14 @@ async fn certificate_selection_and_unknown_sni_match_go() -> Result<()> {
         for sni in ["a.test", "x.b.test", "other.test"] {
             outcome.push(handshake_alert(port, sni, dir.path()).await?);
         }
-        ensure!(outcome[0].is_none() && outcome[1].is_none(), "{name}: {outcome:?}");
         ensure!(
-            outcome[2].as_deref().is_some_and(|e| e.contains("UnrecognisedName")),
+            outcome[0].is_none() && outcome[1].is_none(),
+            "{name}: {outcome:?}"
+        );
+        ensure!(
+            outcome[2]
+                .as_deref()
+                .is_some_and(|e| e.contains("UnrecognisedName")),
             "{name}: {outcome:?}"
         );
         results.push(outcome);

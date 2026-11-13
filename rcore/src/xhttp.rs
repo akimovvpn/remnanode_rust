@@ -277,7 +277,11 @@ impl Config {
             // roomSize: the number of possible IDs must reach 2^31.
             let mut room = 0u128;
             for k in from..=to {
-                let term = if k <= 0 { 1 } else { size.checked_pow(k as u32).unwrap_or(u128::MAX) };
+                let term = if k <= 0 {
+                    1
+                } else {
+                    size.checked_pow(k as u32).unwrap_or(u128::MAX)
+                };
                 room = room.saturating_add(term);
                 if room >= 2 << 30 {
                     break;
@@ -287,7 +291,10 @@ impl Config {
                 room >= 2 << 30,
                 "{path}: sessionIDTable or sessionIDLength is too small"
             );
-            ensure!(from > 0, "{path}: sessionIDLength.from must be greater than 0");
+            ensure!(
+                from > 0,
+                "{path}: sessionIDLength.from must be greater than 0"
+            );
         }
         let data_key = match (data_placement.as_str(), s("uplinkDataKey")?) {
             ("body", _) => String::new(),
