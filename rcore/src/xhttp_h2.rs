@@ -475,7 +475,7 @@ mod tests {
         let service = Arc::new(service);
         let server = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
-            for number in 0usize.. {
+            for number in 0usize..=usize::MAX {
                 let (io, _) = listener.accept().await.unwrap();
                 let service = service.clone();
                 connections.spawn(async move {
