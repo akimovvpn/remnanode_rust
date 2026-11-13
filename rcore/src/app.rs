@@ -2015,6 +2015,7 @@ impl Client {
                     c.add(payload.len() as i64);
                 }
                 remote_write.write_all(&payload).await?;
+                remote_write.flush().await?;
                 activity.touch();
             }
             let mut buf = vec![0u8; 16384];
@@ -2028,6 +2029,7 @@ impl Client {
                     c.add(n as i64);
                 }
                 remote_write.write_all(&buf[..n]).await?;
+                remote_write.flush().await?;
             }
             remote_write.shutdown().await.ok();
             activity.set_timeout(policy.downlink_only);
@@ -2236,5 +2238,72 @@ mod continuation_tests {
             format!("{error:#}").contains("VLESS outbound handshake timeout"),
             "{error:#}"
         );
+    }
+    #[tokio::test]
+    async fn relay_flushes_tls_and_vision_before_waiting_for_more_input() {
+        for vision in [false, true] {
+            let (transport, peer) = tokio::io::duplex(64);
+            let (read, write) = tokio::io::split(transport);
+            let (peer_read, peer_write) = tokio::io::split(peer);
+            let cipher =
+                |key| crate::tls13::Cipher::new(crate::tls13::Suite::Aes128Gcm, vec![key; 32]);
+            let (tls, control) = crate::tls13::stream(read, write, cipher(7), cipher(8), 0);
+            let (peer_tls, peer_control) =
+                crate::tls13::stream(peer_read, peer_write, cipher(8), cipher(7), 0);
+            let (remote, mut peer): (BoxIo, BoxIo) = if vision {
+                (
+                    crate::vision::client(Box::new(tls), [42; 16], control, Vec::new(), &[])
+                        .unwrap(),
+                    crate::vision::wrap(Box::new(peer_tls), &[], [42; 16], peer_control)
+                        .unwrap()
+                        .0,
+                )
+            } else {
+                (Box::new(tls), Box::new(peer_tls))
+            };
+            let (inbound, front) = tokio::io::duplex(8192);
+            let client = Client {
+                conn: Counted::new(Box::new(inbound), None, None),
+                skip: Arc::default(),
+                payload: Vec::new(),
+                payload_counted: false,
+                user_up: None,
+                user_down: None,
+                header_pending: true,
+                vision: None,
+                id: Sid(1),
+            };
+            let relay = tokio::spawn(async move {
+                client
+                    .relay_tcp(remote, &LevelPolicy::default(), None)
+                    .await
+            });
+            let (mut front_read, mut front_write) = tokio::io::split(front);
+            let payload = vec![5; 32768];
+            let send = payload.clone();
+            let writer = tokio::spawn(async move {
+                front_write.write_all(&send).await.unwrap();
+                front_write
+            });
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut received = vec![0; payload.len()];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, payload);
+                peer.write_all(if vision { b"\0\0ok" } else { b"ok" })
+                    .await
+                    .unwrap();
+                peer.flush().await.unwrap();
+                let mut reply = [0; 4];
+                front_read.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"\0\0ok");
+            })
+            .await;
+            relay.abort();
+            writer.abort();
+            assert!(
+                result.is_ok(),
+                "relay stranded a buffered record (Vision={vision})"
+            );
+        }
     }
 }
