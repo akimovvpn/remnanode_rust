@@ -1,4 +1,6 @@
 //! Real Go Xray as a VLESS client (socks in -> vless out) against rcore as the server.
+mod common;
+
 use serde_json::json;
 use std::time::Duration;
 use tokio::{
@@ -46,6 +48,14 @@ async fn go_client_talks_to_rcore(
     server_stream: serde_json::Value,
     client_stream: serde_json::Value,
 ) {
+    with_mux(server_stream, client_stream, json!(null)).await;
+}
+
+async fn with_mux(
+    server_stream: serde_json::Value,
+    client_stream: serde_json::Value,
+    mux: serde_json::Value,
+) {
     let Ok(xray) = std::env::var("XRAY_BINARY") else {
         eprintln!("XRAY_BINARY not set: skipped");
         return;
@@ -60,9 +70,9 @@ async fn go_client_talks_to_rcore(
         "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]}}]
     });
     let client = json!({
-        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": false}}],
+        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": true, "ip": "127.0.0.1"}}],
         "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": server_port,
-                       "users": [{"id": ID, "encryption": "none"}]}]}, "streamSettings": client_stream}]
+                       "users": [{"id": ID, "encryption": "none"}]}]}, "streamSettings": client_stream, "mux": mux}]
     });
     std::fs::write(dir.path().join("server.json"), server.to_string()).unwrap();
     std::fs::write(dir.path().join("client.json"), client.to_string()).unwrap();
@@ -117,7 +127,11 @@ async fn go_client_talks_to_rcore(
     let big: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();
     let (mut r, mut w) = s.into_split();
     let sent = big.clone();
-    let writer = tokio::spawn(async move { w.write_all(&sent).await.unwrap() });
+    // Keep the write half open: mux.cool has no half-close, so EOF would end the session.
+    let writer = tokio::spawn(async move {
+        w.write_all(&sent).await.unwrap();
+        w
+    });
     let mut got = vec![0u8; big.len()];
     tokio::time::timeout(Duration::from_secs(20), r.read_exact(&mut got))
         .await
@@ -152,6 +166,20 @@ async fn go_client_talks_to_rcore(
         "{}",
         String::from_utf8_lossy(&response)
     );
+
+    // UDP to ports other than 53/443 travels as XUDP (mux.cool) even without mux enabled.
+    common::xudp_checks(socks_port).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mux_cool_tcp_and_udp_sub_sessions() {
+    let stream = json!({"network": "raw"});
+    with_mux(
+        stream.clone(),
+        stream,
+        json!({"enabled": true, "concurrency": 8}),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

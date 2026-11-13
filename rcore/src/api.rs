@@ -388,13 +388,20 @@ impl<const V2RAY: bool> tower::Service<http::Request<BoxBody>> for StatsService<
                 "GetSysStats" => {
                     let me = stats();
                     unary(request, move |_: pb::Empty| {
-                        // Go runtime metrics have no Rust equivalent; uptime is exact, memory comes from the OS.
+                        // Go runtime metrics have no Rust equivalent: live tokio tasks stand in for
+                        // goroutines, memory is the process RSS; uptime is exact.
+                        // SAFETY: sysconf has no preconditions.
+                        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as u64;
                         let rss = std::fs::read_to_string("/proc/self/statm")
                             .ok()
                             .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-                            .map(|pages| pages * 4096)
+                            .map(|pages| pages * page)
                             .unwrap_or_default();
+                        let tasks = tokio::runtime::Handle::current()
+                            .metrics()
+                            .num_alive_tasks();
                         Ok(pb::SysStatsResponse {
+                            num_goroutine: tasks as u32,
                             uptime: me.started.elapsed().as_secs() as u32,
                             alloc: rss,
                             sys: rss,

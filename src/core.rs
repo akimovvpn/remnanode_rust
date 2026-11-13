@@ -103,7 +103,7 @@ impl Core {
             "isStarted": result.is_ok(), "version": self.version,
             "error": result.err().map(|e| format!("{e:#}")),
             "nodeInformation":{"version":crate::upstream_version()},
-            "system":{"info":system_info(), "stats":system_stats(), "interface":null}
+            "system":{"info":system_info(), "stats":system_stats(), "interface":interface_stats()}
         }))
     }
 
@@ -866,17 +866,102 @@ pub fn system_info() -> Value {
     json!({"arch":arch,"cpus":system.cpus().len(),"cpuModel":system.cpus().first().map(|c| c.brand()).unwrap_or("unknown"),"memoryTotal":system.total_memory(),"hostname":System::host_name().unwrap_or_default(),"platform":platform,"release":System::kernel_version().unwrap_or_default(),"type":kind,"version":System::long_os_version().unwrap_or_default(),"networkInterfaces":interfaces})
 }
 
+/// getSystemStats: Node's os.freemem() is MemAvailable on Linux.
 pub fn system_stats() -> Value {
     let mut system = System::new();
     system.refresh_memory();
     let load = System::load_average();
-    json!({"memoryFree":system.free_memory(),"memoryUsed":system.total_memory().saturating_sub(system.free_memory()),"uptime":System::uptime(),"loadAvg":[load.one,load.five,load.fifteen],"interface":null})
+    let free = system.available_memory();
+    json!({"memoryFree":free,"memoryUsed":system.total_memory().saturating_sub(free),"uptime":System::uptime(),"loadAvg":[load.one,load.five,load.fifteen],"interface":null})
+}
+
+/// The default-route interface's rates (network-stats.service getDefault), or null.
+static INTERFACE: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+pub fn interface_stats() -> Value {
+    INTERFACE.lock().unwrap().clone().unwrap_or(Value::Null)
+}
+
+/// network-stats.service: samples /proc/net/dev every second for the interface of the
+/// lowest-metric default route in /proc/net/route. Disabled where /proc/net/dev is missing.
+pub fn start_network_stats() {
+    let Ok(dev) = fs::read_to_string("/proc/net/dev") else {
+        tracing::warn!("/proc/net/dev not found — network stats polling disabled (non-Linux OS?)");
+        return;
+    };
+    let route = fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let Some(iface) = default_interface(&route) else {
+        tracing::warn!("Could not resolve default interface from /proc/net/route");
+        return;
+    };
+    tracing::info!(interface = %iface, "Network stats polling started (interval: 1000ms)");
+    let mut previous = interface_bytes(&dev, &iface).map(|bytes| (bytes, Instant::now()));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            let current = fs::read_to_string("/proc/net/dev")
+                .ok()
+                .and_then(|dev| interface_bytes(&dev, &iface));
+            if let (Some(((rx0, tx0), at)), Some((rx, tx))) = (previous, current) {
+                let elapsed = now.duration_since(at).as_secs_f64();
+                if elapsed > 0.0 {
+                    let rate = |new: u64, old: u64| (new as f64 - old as f64).max(0.0) / elapsed;
+                    *INTERFACE.lock().unwrap() = Some(
+                        json!({"interface":iface,"rxBytesPerSec":rate(rx, rx0),"txBytesPerSec":rate(tx, tx0),"rxTotal":rx,"txTotal":tx}),
+                    );
+                }
+            }
+            if let Some(bytes) = current {
+                previous = Some((bytes, now));
+            }
+        }
+    });
+}
+
+fn default_interface(route: &str) -> Option<String> {
+    route
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|f| f.len() >= 11 && f[1] == "00000000")
+        .min_by_key(|f| f[6].parse::<u64>().unwrap_or(0))
+        .map(|f| f[0].to_owned())
+}
+
+/// (rx bytes, tx bytes) of `iface` in /proc/net/dev.
+fn interface_bytes(dev: &str, iface: &str) -> Option<(u64, u64)> {
+    dev.lines().skip(2).find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        let fields: Vec<_> = rest.split_whitespace().collect();
+        (name.trim() == iface && fields.len() >= 16)
+            .then(|| Some((fields[0].parse().ok()?, fields[8].parse().ok()?)))?
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn network_stats_parse_proc_files_like_upstream() {
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            wg0\t00000000\t00000000\t0001\t0\t0\t200\t00000000\t0\t0\t0\n\
+            eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+            eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(default_interface(route).as_deref(), Some("eth0"));
+        assert_eq!(default_interface("Iface\n"), None);
+        let dev = "Inter-|   Receive |  Transmit\n face |bytes packets|bytes\n\
+            \x20   lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n\
+            \x20 eth0: 123456 10 0 0 0 0 0 0 654321 9 0 0 0 0 0 0\n\
+            \x20 bad0: 1 2 3\n";
+        assert_eq!(interface_bytes(dev, "eth0"), Some((123456, 654321)));
+        assert_eq!(interface_bytes(dev, "bad0"), None);
+        assert_eq!(interface_bytes(dev, "wg0"), None);
+    }
 
     #[test]
     fn validates_hash_contract_before_touching_the_process() {

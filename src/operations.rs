@@ -490,15 +490,16 @@ async fn geocheck(body: &Value) -> Result<Value> {
 }
 
 pub async fn handle(path: &str, body: &Value, core: &mut Core) -> Result<Value> {
-    handle_with_whitelist(path, body, core, &[]).await
+    handle_with_plugins(path, body, core, None).await
 }
 
-pub async fn handle_with_whitelist(
+pub async fn handle_with_plugins(
     path: &str,
     body: &Value,
     core: &mut Core,
-    whitelist: &[IpNet],
+    plugins: Option<&crate::plugins::Plugins>,
 ) -> Result<Value> {
+    let whitelist = plugins.map_or(&[][..], |p| p.whitelist());
     if path == "/node/stats/get-geocheck" {
         return geocheck(body).await;
     }
@@ -611,8 +612,11 @@ pub async fn handle_with_whitelist(
         }
         "/node/stats/get-system-stats" => {
             let xray = Grpc::connect(&core.endpoint).await?.sys_stats().await?;
+            let reports = plugins.map_or(0, |p| p.reports_count());
+            let mut stats = crate::core::system_stats();
+            stats["interface"] = crate::core::interface_stats();
             Ok(
-                json!({"xrayInfo":xray,"plugins":{"torrentBlocker":{"reportsCount":0}},"system":{"stats":crate::core::system_stats()}}),
+                json!({"xrayInfo":xray,"plugins":{"torrentBlocker":{"reportsCount":reports}},"system":{"stats":stats}}),
             )
         }
         "/node/stats/get-users-stats"

@@ -1,5 +1,7 @@
 //! Go Xray Vision client -> rcore REALITY server -> local plaintext or TLS application.
 //! Run with XRAY_BINARY=/path/to/xray cargo test -p rcore --test vision_interop.
+mod common;
+
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use serde_json::json;
@@ -120,7 +122,7 @@ async fn setup(dir: &Path, xray: &str) -> Result<(Vec<Child>, u16)> {
         "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]}}]
     });
     let client = json!({"log": {"loglevel": "debug"},
-        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": false}}],
+        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": true, "ip": "127.0.0.1"}}],
         "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": server_port,
             "users": [{"id": ID, "encryption": "none", "flow": FLOW}]}]},
             "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
@@ -321,7 +323,14 @@ async fn inner_tls(dir: &Path, socks: u16, version: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run(version: Option<&str>) {
+#[derive(Clone, Copy)]
+enum Check {
+    Plaintext,
+    InnerTls(&'static str),
+    Xudp,
+}
+
+async fn run(check: Check) {
     let Ok(xray) = std::env::var("XRAY_BINARY") else {
         eprintln!("XRAY_BINARY not set: skipped");
         return;
@@ -338,9 +347,11 @@ async fn run(version: Option<&str>) {
     let dir = tempfile::tempdir().unwrap();
     let result = tokio::time::timeout(Duration::from_secs(45), async {
         let (_processes, socks) = setup(dir.path(), &xray).await.context("Vision fixture")?;
-        match version {
-            Some(version) => inner_tls(dir.path(), socks, version).await,
-            None => plaintext(socks).await,
+        match check {
+            Check::InnerTls(version) => inner_tls(dir.path(), socks, version).await,
+            Check::Plaintext => plaintext(socks).await,
+            // Vision clients send all UDP (DNS, QUIC) as XUDP inside mux.cool.
+            Check::Xudp => common::xudp_checks(socks).await,
         }
     })
     .await;
@@ -374,15 +385,20 @@ async fn run(version: Option<&str>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn vision_plaintext_multiple_and_large_echo() {
-    run(None).await;
+    run(Check::Plaintext).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn vision_inner_tls13_http_upload_and_download() {
-    run(Some("-tls1_3")).await;
+    run(Check::InnerTls("-tls1_3")).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn vision_inner_tls12_http_upload_and_download() {
-    run(Some("-tls1_2")).await;
+    run(Check::InnerTls("-tls1_2")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vision_xudp_full_cone_udp() {
+    run(Check::Xudp).await;
 }

@@ -3,6 +3,7 @@ mod api;
 mod app;
 mod config;
 mod geodata;
+mod mux;
 mod reality;
 mod reality_probe;
 mod reality_profile;

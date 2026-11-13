@@ -123,7 +123,7 @@ fn decode_address(packet: &[u8]) -> Result<(Address, u16, usize)> {
     let raw = &packet[start..end];
     let address = match packet[0] {
         1 => Address::Ip(IpAddr::from(<[u8; 4]>::try_from(raw)?)),
-        4 => Address::Ip(IpAddr::from(<[u8; 16]>::try_from(raw)?)),
+        4 => Address::Ip(IpAddr::from(<[u8; 16]>::try_from(raw)?).to_canonical()),
         _ => Address::Domain(std::str::from_utf8(raw)?.to_owned()),
     };
     Ok((
@@ -140,15 +140,16 @@ pub fn udp_encode(dest: &Address, port: u16, payload: &[u8]) -> Result<Vec<u8>> 
     Ok(packet)
 }
 
-pub fn udp_decode(packet: &[u8]) -> Result<&[u8]> {
+/// Returns the datagram's address, port and payload.
+pub fn udp_decode(packet: &[u8]) -> Result<(Address, u16, &[u8])> {
     ensure!(packet.len() >= 4, "truncated SOCKS UDP header");
     ensure!(packet[..2] == [0, 0], "invalid SOCKS UDP reserved bytes");
     ensure!(
         packet[2] == 0,
         "fragmented SOCKS UDP packets are unsupported"
     );
-    let (_, _, len) = decode_address(&packet[3..])?;
-    Ok(&packet[3 + len..])
+    let (address, port, len) = decode_address(&packet[3..])?;
+    Ok((address, port, &packet[3 + len..]))
 }
 
 #[cfg(test)]
@@ -380,9 +381,12 @@ mod tests {
             ),
         ] {
             assert_eq!(udp_encode(&dest, 443, b"hello").unwrap(), expected);
-            assert_eq!(udp_decode(&expected).unwrap(), b"hello");
+            assert_eq!(
+                udp_decode(&expected).unwrap(),
+                (dest.clone(), 443, &b"hello"[..])
+            );
             let header_len = expected.len() - 5;
-            assert_eq!(udp_decode(&expected[..header_len]).unwrap(), b"");
+            assert_eq!(udp_decode(&expected[..header_len]).unwrap().2, b"");
             for end in 0..header_len {
                 assert!(
                     udp_decode(&expected[..end]).is_err(),

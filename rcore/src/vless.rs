@@ -253,8 +253,14 @@ pub fn uuid_string(id: [u8; 16]) -> String {
     )
 }
 
+/// isMuxAndNotXUDP: `first` is the payload that arrived with the request header.
+fn is_mux_and_not_xudp(request: &Request, first: &[u8]) -> bool {
+    request.command == Command::Mux
+        && (first.len() < 7 || !(first[2] == 0 && first[3] == 0 && first[6] == 2))
+}
+
 /// Inbound flow checks (inbound.go Process). `outer_tls` is true behind TLS 1.3 / REALITY.
-pub fn check_flow(request: &Request, outer_tls: bool) -> Result<()> {
+pub fn check_flow(request: &Request, outer_tls: bool, first: &[u8]) -> Result<()> {
     let account = uuid_string(request.user.id);
     match request.flow.as_str() {
         XRV if request.user.flow == XRV => {
@@ -265,7 +271,8 @@ pub fn check_flow(request: &Request, outer_tls: bool) -> Result<()> {
         XRV => bail!("account {account} is not able to use the flow {XRV}"),
         "" => {
             ensure!(
-                !(request.user.flow == XRV && request.command == Command::Tcp),
+                !(request.user.flow == XRV
+                    && (request.command == Command::Tcp || is_mux_and_not_xudp(request, first))),
                 "account {account} is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters."
             );
             Ok(())
@@ -325,7 +332,7 @@ mod tests {
             (Command::Tcp, 443, Address::Domain("example.com".into()))
         );
         assert_eq!(rest, b"hello");
-        check_flow(&req, false).unwrap();
+        check_flow(&req, false, &rest).unwrap();
         let mut bad = vec![0];
         bad.extend_from_slice(&[8; 16]);
         let error = read_request(&mut bad.as_slice(), &users)
@@ -334,5 +341,29 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("invalid request user id"), "{error}");
+    }
+
+    #[test]
+    fn vision_accounts_without_flow_only_get_xudp_mux() {
+        let request = |command| Request {
+            user: Arc::new(user("v", 1, XRV)),
+            sent_id: [1; 16],
+            flow: String::new(),
+            command,
+            address: Address::Domain("v1.mux.cool".into()),
+            port: 0,
+        };
+        // XUDP: session 0, New, network UDP.
+        let xudp = [0, 12, 0, 0, 1, 1, 2];
+        check_flow(&request(Command::Mux), true, &xudp).unwrap();
+        for first in [
+            &[0, 12, 0, 1, 1, 1, 2][..],
+            &[0, 12, 0, 0, 1, 1, 1],
+            &xudp[..6],
+        ] {
+            assert!(check_flow(&request(Command::Mux), true, first).is_err());
+        }
+        assert!(check_flow(&request(Command::Tcp), true, b"").is_err());
+        check_flow(&request(Command::Udp), true, b"").unwrap();
     }
 }

@@ -708,6 +708,11 @@ impl Plugins {
         &self.plan.whitelist
     }
 
+    /// Torrent-blocker reports waiting for the panel's next collect.
+    pub fn reports_count(&self) -> usize {
+        self.reports.len()
+    }
+
     /// Torrent-blocker routing for the Xray config: (rule tags that also report, rule position).
     pub fn torrent_routing(&self) -> Option<(&[String], u32)> {
         self.plan

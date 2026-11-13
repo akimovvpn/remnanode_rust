@@ -216,7 +216,7 @@ async fn dispatch(
         _ if path.starts_with("/node/plugin/") => runtime.plugins.handle(path, &body).await,
         _ => {
             let Runtime { core, plugins } = &mut *runtime;
-            crate::operations::handle_with_whitelist(path, &body, core, plugins.whitelist()).await
+            crate::operations::handle_with_plugins(path, &body, core, Some(plugins)).await
         }
     };
     match result {
