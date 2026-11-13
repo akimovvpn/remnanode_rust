@@ -24,6 +24,17 @@ impl Profiles {
             .clone()
     }
 
+    /// DetectPostHandshakeRecordsLens: Go probes every server name and ALPN bucket in the
+    /// background when the listener starts, so clients do not wait for calibration.
+    pub fn warm<'a>(&self, dest: &str, names: impl IntoIterator<Item = &'a String>) {
+        for name in names {
+            for alpn in 0..3 {
+                let (profiles, dest, name) = (self.clone(), dest.to_owned(), name.clone());
+                tokio::spawn(async move { profiles.get(&dest, &name, alpn).await });
+            }
+        }
+    }
+
     pub async fn get(&self, dest: &str, name: &str, alpn: u8) -> ProbeResult {
         let cell = self.cell(dest, name, alpn);
         resolve(&cell, async {
@@ -100,6 +111,23 @@ mod tests {
             &profile,
             &cache.cell("different-target", "test", 2)
         ));
+    }
+    #[tokio::test]
+    async fn warm_probes_every_name_and_alpn_bucket_at_start() {
+        let cache = Profiles::default();
+        let names = ["a.example".to_owned(), "b.example".to_owned()];
+        // Port 1 refuses at once, so each background probe completes with the fallback.
+        cache.warm("127.0.0.1:1", &names);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !names
+                .iter()
+                .all(|n| (0..3).all(|a| cache.cell("127.0.0.1:1", n, a).initialized()))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("warm-up did not calibrate every bucket");
     }
     #[tokio::test]
     async fn probe_timeout_does_not_leave_clients_waiting() {

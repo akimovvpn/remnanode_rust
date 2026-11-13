@@ -265,6 +265,9 @@ impl Instance {
                         inbound.listen, inbound.port
                     )
                 })?;
+            if let Some(reality) = &inbound.reality {
+                reality.profiles.warm(&reality.dest, &reality.server_names);
+            }
             let me = self.clone();
             match inbound.kind {
                 InboundKind::Api => {
