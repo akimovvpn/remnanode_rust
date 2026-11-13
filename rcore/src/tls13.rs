@@ -314,7 +314,7 @@ impl DirectControl {
     pub fn write_direct(&self) {
         self.0.fetch_or(2, Ordering::Release);
     }
-    fn flags(&self) -> u8 {
+    pub(crate) fn flags(&self) -> u8 {
         self.0.load(Ordering::Acquire)
     }
     pub fn attach(&self, socket: Arc<tokio::net::TcpStream>) {

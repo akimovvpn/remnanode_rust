@@ -26,7 +26,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWriteExt, DuplexStream, ReadBuf},
     net::TcpListener,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+    sync::{Semaphore, mpsc, watch},
 };
 
 /// splithttp.Config after infra/conf's Build defaults.
@@ -328,8 +328,8 @@ impl Config {
         );
         let max_each = range(&c["scMaxEachPostBytes"], path)?;
         ensure!(
-            max_each.0 >= 0 && max_each.1 <= MAX_QUEUED_PAYLOAD as i64,
-            "{path}: scMaxEachPostBytes must be between 0 and {MAX_QUEUED_PAYLOAD}"
+            max_each.0 >= 0,
+            "{path}: scMaxEachPostBytes must be nonnegative"
         );
         let max_buffered = integer("scMaxBufferedPosts")?;
         ensure!(
@@ -657,7 +657,7 @@ impl Config {
 }
 
 enum Upload {
-    Packet(u64, Vec<u8>, OwnedSemaphorePermit),
+    Packet(u64, Vec<u8>),
     Stream(Incoming),
 }
 
@@ -706,7 +706,7 @@ async fn uplink(
     mut out: DuplexStream,
     max: usize,
 ) -> Result<()> {
-    let mut heap: BTreeMap<u64, (Vec<u8>, OwnedSemaphorePermit)> = BTreeMap::new();
+    let mut heap: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut next = 0u64;
     loop {
         while let Some((seq, _)) = heap.first_key_value() {
@@ -715,7 +715,7 @@ async fn uplink(
                 ensure!(heap.len() - 1 <= max, "packet queue is too large");
                 break;
             }
-            let Some((seq, (data, _budget))) = heap.pop_first() else {
+            let Some((seq, data)) = heap.pop_first() else {
                 break;
             };
             if seq == next {
@@ -732,8 +732,8 @@ async fn uplink(
         };
         match upload {
             None => return Ok(()),
-            Some(Upload::Packet(seq, data, budget)) => {
-                heap.entry(seq).or_insert((data, budget));
+            Some(Upload::Packet(seq, data)) => {
+                heap.entry(seq).or_insert(data);
             }
             Some(Upload::Stream(mut body)) => loop {
                 let frame = tokio::select! {
@@ -821,14 +821,7 @@ struct Server {
     config: Arc<Config>,
     trusted_xff: Vec<String>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    payload_budget: Arc<Semaphore>,
 }
-
-// Bound unauthenticated session IDs independently of the per-session upload queue.
-const MAX_SESSIONS: usize = 1024;
-const MAX_QUEUED_PAYLOAD: usize = 64 * 1024 * 1024;
-// Charge a minimum per upload so empty packets cannot create unbounded blocked tasks.
-const MIN_UPLOAD_RESERVATION: usize = 64 * 1024;
 
 fn status(code: StatusCode, mut headers: HeaderMap) -> Response<Down> {
     let mut response = Response::new(Down::empty());
@@ -840,13 +833,10 @@ fn status(code: StatusCode, mut headers: HeaderMap) -> Response<Down> {
 
 impl Server {
     /// upsertSession: a session not joined by its GET within 30 s is reaped.
-    fn upsert(self: &Arc<Self>, id: &str) -> Option<Arc<Session>> {
+    fn upsert(self: &Arc<Self>, id: &str) -> Arc<Session> {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(s) = sessions.get(id) {
-            return Some(s.clone());
-        }
-        if sessions.len() >= MAX_SESSIONS {
-            return None;
+            return s.clone();
         }
         let (queue, receiver) = mpsc::channel(self.config.max_buffered_posts);
         let session = Arc::new(Session {
@@ -868,7 +858,7 @@ impl Server {
                 reaped.close();
             }
         });
-        Some(session)
+        session
     }
 
     async fn handle(
@@ -947,10 +937,7 @@ impl Server {
         let session = if session_id.is_empty() {
             None
         } else {
-            match self.upsert(&session_id) {
-                Some(session) => Some(session),
-                None => return status(StatusCode::SERVICE_UNAVAILABLE, headers),
-            }
+            Some(self.upsert(&session_id))
         };
         match session {
             Some(session) if uplink && seq.is_empty() => {
@@ -1015,13 +1002,6 @@ impl Server {
             .filter(|_| seq.bytes().all(|b| b.is_ascii_digit()))
         else {
             return status(StatusCode::INTERNAL_SERVER_ERROR, headers);
-        };
-        let Ok(mut budget) = self
-            .payload_budget
-            .clone()
-            .try_acquire_many_owned(c.max_each_post.max(MIN_UPLOAD_RESERVATION) as u32)
-        else {
-            return status(StatusCode::SERVICE_UNAVAILABLE, headers);
         };
         let placement = c.data_placement.as_str();
         let decode = |chunks: Vec<String>| {
@@ -1106,17 +1086,8 @@ impl Server {
             );
             return status(StatusCode::PAYLOAD_TOO_LARGE, headers);
         }
-        let Some(session) = self.upsert(session_id) else {
-            return status(StatusCode::SERVICE_UNAVAILABLE, headers);
-        };
-        let payload_budget = budget
-            .split(payload.len().max(MIN_UPLOAD_RESERVATION))
-            .unwrap();
-        drop(budget);
-        if let Err(error) = session
-            .push(Upload::Packet(seq, payload, payload_budget))
-            .await
-        {
+        let session = self.upsert(session_id);
+        if let Err(error) = session.push(Upload::Packet(seq, payload)).await {
             tracing::info!(
                 "transport/internet/splithttp: failed to upload (PushPayload) > {error}"
             );
@@ -1234,7 +1205,6 @@ pub async fn serve(me: Arc<Instance>, index: usize, listener: TcpListener) {
         config: config.clone(),
         trusted_xff: inbound.trusted_xff.clone(),
         sessions: Mutex::default(),
-        payload_budget: Arc::new(Semaphore::new(MAX_QUEUED_PAYLOAD)),
     });
     loop {
         let Ok((stream, peer)) = listener.accept().await else {
@@ -1306,13 +1276,7 @@ mod tests {
     use serde_json::json;
 
     fn packet(seq: u64, data: Vec<u8>) -> Upload {
-        Upload::Packet(
-            seq,
-            data,
-            Arc::new(Semaphore::new(0))
-                .try_acquire_many_owned(0)
-                .unwrap(),
-        )
+        Upload::Packet(seq, data)
     }
 
     fn server() -> Arc<Server> {
@@ -1331,7 +1295,6 @@ mod tests {
             index: 0,
             trusted_xff: vec![],
             sessions: Mutex::default(),
-            payload_budget: Arc::new(Semaphore::new(MAX_QUEUED_PAYLOAD)),
         })
     }
 
@@ -1490,23 +1453,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_capacity_rejects_new_ids_but_keeps_existing_uploads() {
+    async fn accepts_sessions_past_the_old_rust_only_limit() {
         let server = server();
         for i in 0..1024 {
             server.upsert(&format!("s{i}"));
         }
-        let response = request(server.clone(), Method::GET, "/x/new?x_padding=X").await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let response = request(server.clone(), Method::POST, "/x/s0/0?x_padding=X").await;
+        let response = request(server.clone(), Method::POST, "/x/new/0?x_padding=X").await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(server.sessions.lock().unwrap().len(), 1024);
+        assert_eq!(server.sessions.lock().unwrap().len(), 1025);
     }
 
     #[tokio::test]
-    async fn aggregate_payload_budget_rejects_uploads_until_queued_data_is_released() {
+    async fn accepts_queued_payload_past_the_old_rust_only_budget() {
         let server = server();
         let payload = Bytes::from(vec![1; 1_000_000]);
-        for i in 0..67 {
+        for i in 0..70 {
             let response = request_body(
                 server.clone(),
                 Method::POST,
@@ -1514,31 +1475,14 @@ mod tests {
                 payload.clone(),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::OK, "upload {i}");
         }
-        let response = request_body(
-            server.clone(),
-            Method::POST,
-            "/x/overflow/0?x_padding=X",
-            payload.clone(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        server
-            .sessions
-            .lock()
-            .unwrap()
-            .remove("s0")
-            .unwrap()
-            .close();
-        let response = request_body(
-            server.clone(),
-            Method::POST,
-            "/x/overflow/0?x_padding=X",
-            payload,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn accepts_go_upload_limits_above_sixty_four_mib() {
+        let config = Config::parse(&json!({"scMaxEachPostBytes": 70_000_000}), "x").unwrap();
+        assert_eq!(config.max_each_post, 70_000_000);
     }
 
     #[test]
@@ -1594,7 +1538,6 @@ mod tests {
             json!({"sessionidtable": "number", "sessionIDLength": "0-12"}),
             json!({"sessionIDTable": "абв", "sessionIDLength": 30}),
             json!({"scMaxEachPostBytes": -1}),
-            json!({"scMaxEachPostBytes": 67_108_865}),
             json!({"serverMaxHeaderBytes": 4_294_967_296u64}),
             json!({"scMaxBufferedPosts": 9_223_372_036_854_775_807u64}),
             json!({"host": []}),
@@ -1644,37 +1587,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_uploads_also_have_a_bounded_aggregate_queue() {
-        let mut server = server();
-        Arc::make_mut(&mut Arc::get_mut(&mut server).unwrap().config).max_each_post = 1;
-        for i in 0..1024 {
+    async fn empty_uploads_obey_per_session_queues_without_global_reservations() {
+        let server = server();
+        for i in 0..1025 {
             let response = request(
                 server.clone(),
                 Method::POST,
-                &format!("/x/s{i}/0?x_padding=X"),
+                &format!("/x/s{}/{}?x_padding=X", i % 64, i / 64),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::OK, "upload {i}");
         }
-        let response = request(server, Method::POST, "/x/s0/1?x_padding=X").await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(server.sessions.lock().unwrap().len(), 64);
     }
 
     #[tokio::test(start_paused = true)]
     async fn abandoned_sessions_expire_and_release_payload_while_joined_sessions_survive() {
         let server = server();
-        let abandoned = server.upsert("abandoned").unwrap();
-        let joined = server.upsert("joined").unwrap();
+        let abandoned = server.upsert("abandoned");
+        let joined = server.upsert("joined");
         joined.connected.store(true, Ordering::Release);
-        let budget = server
-            .payload_budget
-            .clone()
-            .try_acquire_many_owned(3)
-            .unwrap();
-        abandoned
-            .push(Upload::Packet(0, vec![1; 3], budget))
-            .await
-            .unwrap();
+        abandoned.push(Upload::Packet(0, vec![1; 3])).await.unwrap();
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(29)).await;
         assert!(!*abandoned.closed.borrow());
@@ -1683,10 +1616,6 @@ mod tests {
         assert!(*abandoned.closed.borrow());
         assert!(!*joined.closed.borrow());
         assert_eq!(server.sessions.lock().unwrap().len(), 1);
-        assert_eq!(
-            server.payload_budget.available_permits(),
-            MAX_QUEUED_PAYLOAD
-        );
     }
 
     #[tokio::test]

@@ -529,6 +529,9 @@ impl AsyncRead for Io {
                 self.read_offset += take;
                 return Poll::Ready(Ok(()));
             }
+            if self.control.flags() & 1 != 0 {
+                return Pin::new(&mut self.inner).poll_read(cx, out);
+            }
             let mut bytes = [0; BUFFER_SIZE];
             let mut buffer = ReadBuf::new(&mut bytes);
             ready!(Pin::new(&mut self.inner).poll_read(cx, &mut buffer))?;
@@ -578,6 +581,9 @@ impl AsyncWrite for Io {
         ready!(self.drain_write(cx))?;
         if data.is_empty() {
             return Poll::Ready(Ok(0));
+        }
+        if self.control.flags() & 2 != 0 {
+            return Pin::new(&mut self.inner).poll_write(cx, data);
         }
         let take = if self.response_left != 0 {
             let take = self.response_left.min(data.len());
@@ -817,6 +823,63 @@ mod tests {
         wrapped.read_to_end(&mut output).await.unwrap();
         writer.await.unwrap();
         assert_eq!(output, b"payloadraw");
+    }
+    #[tokio::test]
+    async fn direct_reads_drain_transition_payload_before_raw_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (inner, mut peer) = tokio::io::duplex(65536);
+        let (mut wrapped, _) = wrap(Box::new(inner), &[], UUID, DirectControl::default()).unwrap();
+        let raw: Vec<u8> = (0..65536).map(|n| n as u8).collect();
+        let expected = [b"transition".as_slice(), &raw].concat();
+        let writer = tokio::spawn(async move {
+            let mut bytes = frame(2, b"transition", 31, true);
+            bytes.extend(raw);
+            peer.write_all(&bytes).await.unwrap();
+            peer.shutdown().await.unwrap();
+        });
+        let mut output = Vec::new();
+        let mut small = [0; 3];
+        loop {
+            let count = wrapped.read(&mut small).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&small[..count]);
+        }
+        writer.await.unwrap();
+        assert_eq!(output, expected);
+    }
+    #[tokio::test]
+    async fn direct_writes_flush_last_frame_before_raw_partial_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (inner, mut peer) = tokio::io::duplex(17);
+        let hello = server_hello(0x1301, true);
+        let record = [23, 3, 3, 0, 4, 1, 2, 3, 4];
+        let raw = vec![7; 65536];
+        let expected = [hello.as_slice(), &record, &raw].concat();
+        let (mut wrapped, _) = wrap(
+            Box::new(inner),
+            &frame(0, &[22, 3, 3, 0, 1, 1], 0, true),
+            UUID,
+            DirectControl::default(),
+        )
+        .unwrap();
+        let writer = tokio::spawn(async move {
+            wrapped.write_all(&[0, 0]).await.unwrap();
+            wrapped.write_all(&hello).await.unwrap();
+            wrapped.write_all(&record).await.unwrap();
+            wrapped.write_all(&raw).await.unwrap();
+            wrapped.shutdown().await.unwrap();
+        });
+        let mut wire = Vec::new();
+        peer.read_to_end(&mut wire).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(&wire[..2], &[0, 0]);
+        let mut decoder = Decoder::new(UUID, shared());
+        let decoded = decoder.decode(&wire[2..]).unwrap();
+        assert!(decoded.direct);
+        assert_eq!(decoded.data, expected);
+        decoder.finish().unwrap();
     }
     #[tokio::test]
     async fn cancelled_pending_write_does_not_acknowledge_another_buffer() {

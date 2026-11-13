@@ -134,6 +134,8 @@ Then enable *Settings → Actions → General → Allow GitHub Actions to create
 
 ## Develop
 
+Release CPU and memory measurements, limitations and reproduction commands: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
 ```bash
 cargo test --locked --workspace
 python3 -m unittest discover -s scripts/tests
