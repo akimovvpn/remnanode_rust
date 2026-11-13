@@ -7,3 +7,5 @@ This Rust core ports a subset of [XTLS/Xray-core v26.11.9](https://github.com/XT
 The TLS key schedule has RFC 8448 regression vectors. Live tests use the actual Go Xray client and local OpenSSL targets. This is an experimental subset, with the unsupported config fields and camouflage differences described in the root README. It has not had an independent cryptographic security audit.
 
 The probe ClientHello fixtures were captured from the pinned Go Xray binary; `tests/fixtures/README.md` records their provenance. The native probe refreshes ephemeral keys and random fields. Broader fingerprint-distribution and certificate-policy differences are described in the root README.
+
+The XHTTP outbound files translate Xray's `transport/internet/splithttp` client, configuration, padding and XMUX logic. `src/xhttp_h2.rs` and `src/xhttp_redirect.rs` also translate Go 1.27.3 `net/http` connection-pooling, retry and redirect behavior; the Go BSD notice in `LICENSE-Go` applies to those portions. The raw HTTP/1 upload pool follows Go's `sync.Pool` private/shared ownership and `Request.Write` trace ordering.

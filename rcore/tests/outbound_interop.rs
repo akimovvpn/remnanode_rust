@@ -24,8 +24,11 @@ fn free_port() -> u16 {
         .port()
 }
 
-async fn wait_port(port: u16) -> Result<()> {
+async fn wait_port(port: u16, child: &mut Child) -> Result<()> {
     for _ in 0..100 {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("process for port {port} exited: {status}");
+        }
         if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return Ok(());
         }
@@ -163,6 +166,77 @@ fn profiles(
         "users": [{"id": ID, "flow": flow, "encryption": "none"}]}]})
     };
     match kind {
+        "xhttp-http-packet-up"
+        | "xhttp-http-auto"
+        | "xhttp-tls-h2-auto"
+        | "xhttp-tls-h2-stream-up"
+        | "xhttp-tls-h1-stream-one"
+        | "xhttp-reality-h2-stream-one"
+        | "xhttp-reality-h2-auto"
+        | "xhttp-header-uplink"
+        | "xhttp-cookie-uplink" => {
+            let settings = match kind {
+                "xhttp-http-auto" | "xhttp-tls-h2-auto" | "xhttp-reality-h2-auto" => {
+                    json!({"path": "/x"})
+                }
+                "xhttp-tls-h2-stream-up" => json!({"path": "/x", "mode": "stream-up"}),
+                "xhttp-reality-h2-stream-one" | "xhttp-tls-h1-stream-one" => {
+                    json!({"path": "/x", "mode": "stream-one"})
+                }
+                "xhttp-header-uplink" => {
+                    json!({"mode": "packet-up", "path": "/files/download/?fixture=outbound", "extra": {
+                    "headers": {"X-Code": "x"}, "xPaddingBytes": "50-80", "xPaddingObfsMode": true,
+                    "xPaddingPlacement": "header", "xPaddingHeader": "X-Padding",
+                    "sessionIDPlacement": "header", "sessionIDKey": "X-Session", "seqPlacement": "query", "seqKey": "id",
+                    "uplinkHTTPMethod": "GET", "uplinkDataPlacement": "header", "uplinkDataKey": "X-Data",
+                    "scMaxEachPostBytes": 3000, "scMinPostsIntervalMs": 1}})
+                }
+                "xhttp-cookie-uplink" => json!({"mode": "packet-up", "path": "/q", "extra": {
+                    "xPaddingObfsMode": true, "xPaddingMethod": "tokenish", "xPaddingPlacement": "cookie", "xPaddingKey": "pad",
+                    "sessionIDPlacement": "query", "sessionIDKey": "session", "seqPlacement": "header", "seqKey": "X-Seq",
+                    "uplinkDataPlacement": "cookie", "uplinkDataKey": "data", "uplinkChunkSize": 512,
+                    "scMaxEachPostBytes": 2000, "scMinPostsIntervalMs": 1}}),
+                _ => json!({"path": "/x", "mode": "packet-up"}),
+            };
+            let mut server = json!({"network": "xhttp", "xhttpSettings": settings});
+            let mut stream = server.clone();
+            if kind == "xhttp-tls-h2-auto" {
+                server["xhttpSettings"]["mode"] = json!("packet-up");
+            } else if kind == "xhttp-reality-h2-auto" {
+                server["xhttpSettings"]["mode"] = json!("stream-one");
+            }
+            if kind.starts_with("xhttp-tls-") {
+                let alpn = if kind == "xhttp-tls-h1-stream-one" {
+                    "http/1.1"
+                } else {
+                    "h2"
+                };
+                server["security"] = json!("tls");
+                server["tlsSettings"] = json!({"certificates": certs, "alpn": [alpn]});
+                stream["security"] = json!("tls");
+                stream["tlsSettings"] = json!({"serverName": SNI, "alpn": [alpn]});
+                if kind == "xhttp-tls-h1-stream-one" {
+                    stream["network"] = json!("splithttp");
+                    let settings = stream
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("xhttpSettings")
+                        .unwrap();
+                    stream["splithttpSettings"] = settings;
+                }
+            } else if kind.starts_with("xhttp-reality-") {
+                server["security"] = json!("reality");
+                server["realitySettings"] = reality_server["realitySettings"].clone();
+                stream["security"] = json!("reality");
+                stream["realitySettings"] = json!({"publicKey": b64.encode(public.as_bytes()),
+                    "serverName": SNI, "shortId": "0123abcd", "fingerprint": "chrome"});
+            }
+            (
+                server,
+                json!({"protocol": "vless", "settings": vnext(""), "streamSettings": stream}),
+                "",
+            )
+        }
         "reality-vision-firefox" => (
             reality_server,
             json!({"protocol": "vless", "settings": vnext(FLOW), "streamSettings": {"network": "raw",
@@ -273,6 +347,7 @@ async fn inner_tls(dir: &Path, socks: u16) -> Result<()> {
         for chunk in sent.chunks(16384) {
             w.write_all(chunk).await?;
         }
+        w.flush().await?;
         anyhow::Ok(w)
     });
     let mut got = vec![0u8; big.len()];
@@ -289,7 +364,7 @@ async fn setup(dir: &Path, xray: &str, kind: &str) -> Result<(Vec<Child>, u16)> 
     let (target_port, server_port, rcore_port, socks_port) =
         (free_port(), free_port(), free_port(), free_port());
     let mut children = Vec::new();
-    if kind.starts_with("reality") {
+    if kind.starts_with("reality") || kind.starts_with("xhttp-reality-") {
         tls_target(dir, target_port).await?;
     }
     let (server_stream, outbound, flow) = profiles(kind, server_port, target_port, dir);
@@ -335,8 +410,11 @@ async fn setup(dir: &Path, xray: &str, kind: &str) -> Result<(Vec<Child>, u16)> 
         dir,
         "client",
     )?);
-    for port in [server_port, rcore_port, socks_port] {
-        wait_port(port).await?;
+    for (port, child) in [server_port, rcore_port, socks_port]
+        .into_iter()
+        .zip(&mut children)
+    {
+        wait_port(port, child).await?;
     }
     Ok((children, socks_port))
 }
@@ -407,4 +485,49 @@ async fn raw_tls_vision_chrome() {
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_plain() {
     run("raw").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_http_packet_up() {
+    run("xhttp-http-packet-up").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_http_auto() {
+    run("xhttp-http-auto").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_tls_h2_stream_up() {
+    run("xhttp-tls-h2-stream-up").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_reality_h2_stream_one() {
+    run("xhttp-reality-h2-stream-one").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_header_uplink_padding_and_session_header_seq_query() {
+    run("xhttp-header-uplink").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_cookie_uplink_padding_and_session_query_seq_header() {
+    run("xhttp-cookie-uplink").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_tls_h2_auto_packet_up() {
+    run("xhttp-tls-h2-auto").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn splithttp_tls_http11_stream_one() {
+    run("xhttp-tls-h1-stream-one").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xhttp_reality_h2_auto_stream_one() {
+    run("xhttp-reality-h2-auto").await;
 }

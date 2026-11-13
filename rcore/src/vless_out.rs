@@ -26,6 +26,7 @@ use tokio::{
 
 pub enum Network {
     Raw,
+    Xhttp(Arc<crate::xhttp_client::Client>),
     Ws {
         path: String,
         host: String,
@@ -35,6 +36,7 @@ pub enum Network {
     },
 }
 
+#[derive(Clone)]
 pub enum Security {
     None,
     Tls(crate::tls_client::Client),
@@ -113,6 +115,9 @@ impl Server {
         socket: &crate::socket::Options,
         early: &[u8],
     ) -> Result<(BoxIo, Option<DirectControl>)> {
+        if let Network::Xhttp(client) = &self.network {
+            return Ok((client.connect(self, socket).await?, None));
+        }
         let addrs: Vec<_> = match &self.address {
             Address::Ip(ip) => vec![std::net::SocketAddr::new(*ip, self.port)],
             Address::Domain(d) => tokio::net::lookup_host((d.as_str(), self.port))
@@ -130,6 +135,7 @@ impl Server {
         };
         match &self.network {
             Network::Raw => Ok((io, direct)),
+            Network::Xhttp(_) => unreachable!(),
             Network::Ws {
                 path,
                 host,

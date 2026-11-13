@@ -516,6 +516,23 @@ fn parse_vless_outbound(
     };
     let network = match stream["network"].as_str().unwrap_or("raw") {
         "raw" | "tcp" | "" => crate::vless_out::Network::Raw,
+        "xhttp" | "splithttp" => {
+            let key = if stream["xhttpSettings"].is_null() {
+                "splithttpSettings"
+            } else {
+                "xhttpSettings"
+            };
+            if let crate::vless_out::Security::Tls(tls) = &security {
+                ensure!(
+                    tls.alpn != ["h3"],
+                    "{}",
+                    unsupported(&format!("{sp}: XHTTP over HTTP/3"))
+                );
+            }
+            crate::vless_out::Network::Xhttp(std::sync::Arc::new(crate::xhttp_client::Client::new(
+                crate::xhttp_request::Config::parse(&stream[key], &format!("{sp}.{key}"))?,
+            )))
+        }
         "ws" | "websocket" => {
             let ws = &stream["wsSettings"];
             let (path, mut host) = http_transport(ws, true, &format!("{sp}.wsSettings"))?;
@@ -1417,6 +1434,8 @@ impl Config {
                     "tcpSettings",
                     "rawSettings",
                     "wsSettings",
+                    "xhttpSettings",
+                    "splithttpSettings",
                     "tlsSettings",
                     "realitySettings",
                 ]

@@ -96,6 +96,21 @@ pub fn chrome_headers(variant: &str, existing: impl Fn(&str) -> bool) -> Vec<(St
                 }
             }
         }
+        "fetch" => {
+            h.push(("Sec-Fetch-Mode", "cors".into()));
+            h.push(("Sec-Fetch-Dest", "empty".into()));
+            h.push(("Sec-Fetch-Site", "same-origin".into()));
+            for (k, v) in [
+                ("Priority", "u=1, i"),
+                ("Cache-Control", "no-cache"),
+                ("Pragma", "no-cache"),
+                ("Accept", "*/*"),
+            ] {
+                if !existing(k) {
+                    h.push((k, v.into()));
+                }
+            }
+        }
         _ => {}
     }
     h.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()

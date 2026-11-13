@@ -28,6 +28,8 @@ mod vision;
 mod vless;
 mod vless_out;
 mod xhttp;
+mod xhttp_client;
+mod xhttp_request;
 
 use anyhow::{Context, Result};
 use std::process::ExitCode;

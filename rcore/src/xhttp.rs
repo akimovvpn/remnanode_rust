@@ -90,7 +90,7 @@ const KEYS: &[&str] = &[
 
 /// encoding/json into SplitHTTPConfig: keys match the fields case-insensitively and names that
 /// are not fields are dropped, as Go ignores them.
-fn go_fields(v: &Value) -> Value {
+pub(crate) fn go_fields(v: &Value) -> Value {
     let Some(object) = v.as_object() else {
         return v.clone();
     };
@@ -109,7 +109,7 @@ fn go_fields(v: &Value) -> Value {
 }
 
 /// conf.Int32Range: an integer or "from-to" string (also "-1--5"), ordered.
-fn range(v: &Value, path: &str) -> Result<(i64, i64)> {
+pub(crate) fn range(v: &Value, path: &str) -> Result<(i64, i64)> {
     let (a, b) = match v {
         Value::Null => (0, 0),
         Value::Number(n) => {
@@ -385,7 +385,7 @@ impl Config {
     }
 }
 
-fn rand_between((from, to): (i64, i64)) -> i64 {
+pub(crate) fn rand_between((from, to): (i64, i64)) -> i64 {
     if to <= from {
         return from;
     }
@@ -416,7 +416,7 @@ fn huffman_len(s: &str) -> i64 {
 const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /// GeneratePadding: X/Z have 8-bit Huffman codes, so HPACK/QPACK keep the padding length.
-fn generate_padding(method: &str, length: i64) -> String {
+pub(crate) fn generate_padding(method: &str, length: i64) -> String {
     if length <= 0 {
         return String::new();
     }

@@ -55,6 +55,7 @@ impl Fingerprint {
     }
 }
 
+#[derive(Clone)]
 pub struct Reality {
     pub public_key: [u8; 32],
     pub short_id: [u8; 8],
@@ -62,6 +63,7 @@ pub struct Reality {
     pub spider_y: [i64; 10],
 }
 
+#[derive(Clone)]
 pub struct Client {
     /// SNI and certificate name; the caller fills in the destination address when empty.
     pub server_name: String,

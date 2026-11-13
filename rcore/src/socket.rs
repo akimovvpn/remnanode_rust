@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::os::fd::AsFd;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     pub interface: String,
     pub tcp_fast_open: Option<bool>,
