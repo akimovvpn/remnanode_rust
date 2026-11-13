@@ -556,7 +556,7 @@ pub async fn connect(mut tcp: TcpStream, client: &Client) -> Result<(BoxIo, Dire
                     let io: BoxIo = Box::new(stream);
                     if let (Some(reality), false) = (&client.reality, verified) {
                         tracing::error!(
-                            "REALITY: received real certificate (potential MITM or redirection)"
+                            "transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)"
                         );
                         let y = reality.spider_y;
                         tokio::spawn(spider(

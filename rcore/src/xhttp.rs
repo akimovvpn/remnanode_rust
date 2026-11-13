@@ -829,14 +829,20 @@ impl Server {
             .or_else(|| header(req.headers(), "host").map(str::to_owned))
             .unwrap_or_default();
         if !c.host.is_empty() && !crate::transport::valid_host(&host, &c.host) {
-            tracing::info!("failed to validate host, request:{host}, config:{}", c.host);
+            tracing::info!(
+                "transport/internet/splithttp: failed to validate host, request:{host}, config:{}",
+                c.host
+            );
             return status(StatusCode::NOT_FOUND, HeaderMap::new());
         }
         let path = percent_encoding::percent_decode_str(req.uri().path())
             .decode_utf8_lossy()
             .into_owned();
         if !path.starts_with(&c.path) {
-            tracing::info!("failed to validate path, request:{path}, config:{}", c.path);
+            tracing::info!(
+                "transport/internet/splithttp: failed to validate path, request:{path}, config:{}",
+                c.path
+            );
             return status(StatusCode::NOT_FOUND, HeaderMap::new());
         }
         let mut headers = HeaderMap::new();
@@ -849,14 +855,17 @@ impl Server {
         }
         let (padding, placement) = c.extract_padding(&req);
         if !padding_valid(&padding, c.padding, &c.padding_method) {
-            tracing::info!("invalid padding ({placement}) length:{}", padding.len());
+            tracing::info!(
+                "transport/internet/splithttp: invalid padding ({placement}) length:{}",
+                padding.len()
+            );
             return status(StatusCode::BAD_REQUEST, headers);
         }
         let obfs_padding = c.obfs && !padding.is_empty();
         let (session_id, seq) = c.extract_meta(&req, &path);
         if session_id.is_empty() && !matches!(c.mode.as_str(), "auto" | "stream-one" | "stream-up")
         {
-            tracing::info!("stream-one mode is not allowed");
+            tracing::info!("transport/internet/splithttp: stream-one mode is not allowed");
             return status(StatusCode::BAD_REQUEST, headers);
         }
         let remote = crate::transport::forwarded_for(
@@ -891,7 +900,9 @@ impl Server {
             Some(session) if uplink && seq.is_empty() => {
                 let referer = header(req.headers(), "Referer").is_some();
                 if let Err(error) = session.push(Upload::Stream(req.into_body())).await {
-                    tracing::info!("failed to upload (PushReader) > {error}");
+                    tracing::info!(
+                        "transport/internet/splithttp: failed to upload (PushReader) > {error}"
+                    );
                     return status(StatusCode::CONFLICT, headers);
                 }
                 headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
@@ -925,7 +936,10 @@ impl Server {
                 self.download(req, session, session_id, remote, local, headers)
             }
             _ => {
-                tracing::info!("unsupported method: {}", req.method());
+                tracing::info!(
+                    "transport/internet/splithttp: unsupported method: {}",
+                    req.method()
+                );
                 status(StatusCode::METHOD_NOT_ALLOWED, headers)
             }
         }
@@ -968,7 +982,9 @@ impl Server {
             match decode(chunks) {
                 Ok(data) => payload.extend(data),
                 Err(error) => {
-                    tracing::info!("Invalid base64 in header's payload: {error}");
+                    tracing::info!(
+                        "transport/internet/splithttp: Invalid base64 in header's payload: {error}"
+                    );
                     return status(StatusCode::BAD_REQUEST, headers);
                 }
             }
@@ -980,7 +996,9 @@ impl Server {
             match decode(chunks) {
                 Ok(data) => payload.extend(data),
                 Err(error) => {
-                    tracing::info!("Invalid base64 in cookies' payload: {error}");
+                    tracing::info!(
+                        "transport/internet/splithttp: Invalid base64 in cookies' payload: {error}"
+                    );
                     return status(StatusCode::BAD_REQUEST, headers);
                 }
             }
@@ -991,7 +1009,7 @@ impl Server {
                 header(req.headers(), "content-length").and_then(|v| v.parse::<u64>().ok());
             if length.is_some_and(|l| l > c.max_each_post as u64) {
                 tracing::info!(
-                    "Too large upload. scMaxEachPostBytes is set to {}but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.",
+                    "transport/internet/splithttp: Too large upload. scMaxEachPostBytes is set to {}but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.",
                     c.max_each_post
                 );
                 return status(StatusCode::PAYLOAD_TOO_LARGE, headers);
@@ -1007,7 +1025,9 @@ impl Server {
                         }
                     }
                     Some(Err(error)) => {
-                        tracing::info!("failed to read body payload > {error}");
+                        tracing::info!(
+                            "transport/internet/splithttp: failed to read body payload > {error}"
+                        );
                         return status(StatusCode::BAD_REQUEST, headers);
                     }
                     None => break,
@@ -1015,7 +1035,9 @@ impl Server {
             }
             data.truncate(limit);
             if length.is_some_and(|l| (data.len() as u64) < l) {
-                tracing::info!("failed to read body payload > unexpected EOF");
+                tracing::info!(
+                    "transport/internet/splithttp: failed to read body payload > unexpected EOF"
+                );
                 return status(StatusCode::BAD_REQUEST, headers);
             }
             body_len = data.len();
@@ -1023,7 +1045,7 @@ impl Server {
         }
         if payload.len() > c.max_each_post {
             tracing::info!(
-                "Too large upload. scMaxEachPostBytes is set to {}but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.",
+                "transport/internet/splithttp: Too large upload. scMaxEachPostBytes is set to {}but request size exceed it. Adjust scMaxEachPostBytes on the server to be at least as large as client.",
                 c.max_each_post
             );
             return status(StatusCode::PAYLOAD_TOO_LARGE, headers);
@@ -1039,7 +1061,9 @@ impl Server {
             .push(Upload::Packet(seq, payload, payload_budget))
             .await
         {
-            tracing::info!("failed to upload (PushPayload) > {error}");
+            tracing::info!(
+                "transport/internet/splithttp: failed to upload (PushPayload) > {error}"
+            );
             return status(StatusCode::INTERNAL_SERVER_ERROR, headers);
         }
         if body_len == 0 {
@@ -1107,10 +1131,11 @@ impl Server {
         let conn: BoxIo = Box::new(tokio::io::join(up_read, down_write));
         let (me, index) = (self.me.clone(), self.index);
         tokio::spawn(async move {
+            let id = crate::app::session_id();
             tokio::select! {
-                result = me.clone().vless_conn(index, conn, remote, local, None) => {
+                result = me.vless_conn(index, conn, remote, local, None, id) => {
                     if let Err(error) = result {
-                        tracing::info!("[{}] {remote} {error:#}", me.config.inbounds[index].tag);
+                        tracing::info!("[{id}] app/proxyman/inbound: connection ends > {error:#}");
                     }
                 }
                 _ = lifetime.closed() => {}
@@ -1173,7 +1198,7 @@ pub async fn serve(me: Arc<Instance>, index: usize, listener: TcpListener) {
                     match crate::reality::accept(reality, stream, handshake).await {
                         Ok((io, _)) => io,
                         Err(error) => {
-                            tracing::info!("[{}] {peer} {error:#}", inbound.tag);
+                            tracing::info!("transport/internet/splithttp: {error:#}");
                             return;
                         }
                     }

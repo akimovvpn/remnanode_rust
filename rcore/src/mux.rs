@@ -289,7 +289,7 @@ fn release(session: Session) {
             {
                 x.status = Status::Expiring;
                 x.expire = Instant::now() + Duration::from_secs(60);
-                tracing::debug!("XUDP put {id:?}");
+                tracing::debug!("common/mux: XUDP put {}", global_id(&id));
             }
         }
     }
@@ -326,7 +326,7 @@ static XUDP: LazyLock<Mutex<HashMap<[u8; 8], Xudp>>> = LazyLock::new(|| {
             XUDP.lock().unwrap().retain(|id, x| {
                 let keep = x.status != Status::Expiring || now <= x.expire;
                 if !keep {
-                    tracing::debug!("XUDP del {id:?}");
+                    tracing::debug!("common/mux: XUDP del {}", global_id(id));
                 }
                 keep
             });
@@ -499,7 +499,8 @@ impl Mux {
         let (network, address, port) = meta.target.clone().context("missing target")?;
         let udp = network == UDP;
         tracing::info!(
-            "received request for {}:{address}:{port}",
+            "[{}] common/mux: received request for {}:{address}:{port}",
+            self.base.id,
             if udp { "udp" } else { "tcp" }
         );
         // It breaks the whole mux connection, as in Go.
@@ -583,7 +584,9 @@ impl Mux {
             }
         };
         if !delivered {
-            tracing::info!("failed to write to downstream writer. closing session {id}");
+            tracing::info!(
+                "common/mux: failed to write to downstream writer. closing session {id}"
+            );
             self.worker.close(id, Some(stop));
         }
         Ok(())
@@ -615,7 +618,11 @@ impl Mux {
                 }
                 Some(x) if x.status == Status::Initializing => {
                     // Nearly impossible; the client gets End after its next Keep frame.
-                    tracing::warn!("XUDP hit {id:?}: conflict");
+                    tracing::warn!(
+                        "[{}] common/mux: XUDP hit {} > conflict",
+                        self.base.id,
+                        global_id(&id)
+                    );
                     return Ok(());
                 }
                 Some(x) => {
@@ -635,11 +642,19 @@ impl Mux {
             if let Some(previous) = previous {
                 match previous.up.send(first.take().expect("first packet")).await {
                     Ok(()) => {
-                        tracing::info!("XUDP hit {id:?}");
+                        tracing::info!(
+                            "[{}] common/mux: XUDP hit {}",
+                            self.base.id,
+                            global_id(&id)
+                        );
                         link = Some(previous);
                     }
                     Err(mpsc::error::SendError(packet)) => {
-                        tracing::info!("XUDP hit {id:?}: io: read/write on closed pipe");
+                        tracing::info!(
+                            "[{}] common/mux: XUDP hit {} > io: read/write on closed pipe",
+                            self.base.id,
+                            global_id(&id)
+                        );
                         first = Some(packet);
                     }
                 }
@@ -659,7 +674,7 @@ impl Mux {
                 if let Some(first) = first {
                     let _ = up.send(first).await;
                 }
-                tracing::info!("XUDP new {id:?}");
+                tracing::info!("[{}] common/mux: XUDP new {}", self.base.id, global_id(&id));
                 XudpLink {
                     up,
                     down: Arc::new(AsyncMutex::new(down)),
@@ -715,7 +730,7 @@ impl Mux {
                 .await
             {
                 failed.store(true, Ordering::Relaxed);
-                log_failure(&me, &base, &error);
+                log_failure(&base, &error);
             }
             drop(pipe);
         });
@@ -734,19 +749,24 @@ impl Mux {
             let down = link.down.clone();
             if let Err(error) = me.dispatch_packets(&base, address, port, link).await {
                 failed.store(true, Ordering::Relaxed);
-                log_failure(&me, &base, &error);
+                log_failure(&base, &error);
             }
             drop(down);
         });
     }
 }
 
-fn log_failure(me: &Instance, base: &Base, error: &anyhow::Error) {
+fn log_failure(base: &Base, error: &anyhow::Error) {
     tracing::info!(
-        "[{}] {} {error:#}",
-        me.config.inbounds[base.index].tag,
-        base.peer
+        "[{}] app/proxyman/outbound: failed to process outbound traffic > {error:#}",
+        base.id
     );
+}
+
+/// A GlobalID as Go prints a [8]byte: "[1 2 3 4 5 6 7 8]".
+fn global_id(id: &[u8; 8]) -> String {
+    let bytes: Vec<String> = id.iter().map(u8::to_string).collect();
+    format!("[{}]", bytes.join(" "))
 }
 
 /// End frame (with OptionError after an interruption), then Session.Close.

@@ -1781,6 +1781,7 @@ dependencies = [
  "bolero",
  "brotli",
  "bytes",
+ "chrono",
  "flate2",
  "hkdf",
  "hmac",

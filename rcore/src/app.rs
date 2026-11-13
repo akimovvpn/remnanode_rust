@@ -46,6 +46,20 @@ pub(crate) struct Base {
     pub user_up: Option<Arc<Counter>>,
     pub user_down: Option<Arc<Counter>>,
     pub mux: bool,
+    /// session.ID: shown as "[id]" on every log line of this connection.
+    pub id: u32,
+}
+
+/// session.NewID: a random non-zero ID per inbound connection.
+pub(crate) fn session_id() -> u32 {
+    loop {
+        let mut b = [0u8; 4];
+        let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b);
+        let id = u32::from_le_bytes(b);
+        if id != 0 {
+            return id;
+        }
+    }
 }
 
 impl Base {
@@ -289,12 +303,11 @@ impl Instance {
                             };
                             let me = me.clone();
                             tokio::spawn(async move {
-                                if let Err(error) =
-                                    me.clone().vless_session(index, stream, peer).await
+                                let id = session_id();
+                                if let Err(error) = me.vless_session(index, stream, peer, id).await
                                 {
                                     tracing::info!(
-                                        "[{}] {peer} {error:#}",
-                                        me.config.inbounds[index].tag
+                                        "[{id}] app/proxyman/inbound: connection ends > {error:#}"
                                     );
                                 }
                             });
@@ -311,12 +324,13 @@ impl Instance {
         index: usize,
         stream: TcpStream,
         peer: SocketAddr,
+        id: u32,
     ) -> Result<()> {
         let inbound = &self.config.inbounds[index];
         let local = stream.local_addr()?;
         stream.set_nodelay(true).ok();
-        let (io, peer, direct): (BoxIo, SocketAddr, Option<crate::tls13::DirectControl>) =
-            match &inbound.transport {
+        let accepted: Result<(BoxIo, SocketAddr, Option<crate::tls13::DirectControl>)> = async {
+            Ok(match &inbound.transport {
                 Transport::Raw => match &inbound.reality {
                     Some(reality) => {
                         let (io, direct) = crate::reality::accept(
@@ -327,7 +341,7 @@ impl Instance {
                         .await?;
                         (io, peer, Some(direct))
                     }
-                    None => (Box::new(stream), peer, None),
+                    None => (Box::new(stream) as BoxIo, peer, None),
                 },
                 Transport::Ws {
                     path,
@@ -344,8 +358,23 @@ impl Instance {
                     (io, peer, None)
                 }
                 Transport::Xhttp(_) => bail!("XHTTP connections are served by xhttp::serve"),
-            };
-        self.vless_conn(index, io, peer, local, direct).await
+            })
+        }
+        .await;
+        let (io, peer, direct) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // Transport hubs reject before a session exists, so Go logs them without an ID.
+                let hub = match &inbound.transport {
+                    Transport::Ws { .. } => "transport/internet/websocket",
+                    Transport::HttpUpgrade { .. } => "transport/internet/httpupgrade",
+                    _ => "transport/internet/tcp",
+                };
+                tracing::info!("{hub}: {error:#}");
+                return Ok(());
+            }
+        };
+        self.vless_conn(index, io, peer, local, direct, id).await
     }
 
     /// A VLESS connection over an established transport (raw/REALITY, WS, HTTPUpgrade, XHTTP).
@@ -356,6 +385,7 @@ impl Instance {
         peer: SocketAddr,
         local: SocketAddr,
         direct: Option<crate::tls13::DirectControl>,
+        id: u32,
     ) -> Result<()> {
         let inbound = &self.config.inbounds[index];
         let tag = &inbound.tag;
@@ -377,15 +407,30 @@ impl Instance {
             .context("inbound without users")?
             .clone();
         let handshake = self.config.policy.level(0).handshake;
-        let (request, mut payload) =
-            match tokio::time::timeout(handshake, vless::read_request(&mut conn, &users))
-                .await
-                .context("handshake timeout")?
-            {
-                Ok(request) => request,
-                Err(error) if error.is::<vless::EmptyRequest>() => return Ok(()),
-                Err(error) => return Err(error.context(format!("invalid request from {peer}"))),
+        let read = async {
+            // Go reads once into `first` and logs its length before decoding the header.
+            let mut first = vec![0u8; 8192];
+            let n = conn.read(&mut first).await?;
+            if n == 0 {
+                return Err(vless::EmptyRequest.into());
+            }
+            tracing::info!("[{id}] proxy/vless/inbound: firstLen = {n}");
+            first.truncate(n);
+            let mut reader = crate::transport::Prefixed {
+                prefix: first,
+                pos: 0,
+                inner: &mut conn,
             };
+            vless::read_request(&mut reader, &users).await
+        };
+        let (request, mut payload) = match tokio::time::timeout(handshake, read)
+            .await
+            .context("handshake timeout")?
+        {
+            Ok(request) => request,
+            Err(error) if error.is::<vless::EmptyRequest>() => return Ok(()),
+            Err(error) => return Err(error.context(format!("invalid request from {peer}"))),
+        };
         vless::check_flow(&request, inbound.reality.is_some(), &payload)?;
         if request.flow == vless::XRV {
             let (io, decoded) = crate::vision::wrap(
@@ -398,6 +443,16 @@ impl Instance {
             payload = decoded;
         }
         let user = request.user.clone();
+        tracing::info!(
+            "[{id}] proxy/vless/inbound: received request for {}:{}:{}",
+            if request.command == Command::Udp {
+                "udp"
+            } else {
+                "tcp"
+            },
+            request.address,
+            request.port
+        );
         if request.command == Command::Rvs {
             // Reverse proxies need a user `reverse` setting, which rcore does not accept.
             bail!(
@@ -410,6 +465,7 @@ impl Instance {
         let _online = (policy.user_online && !email.is_empty())
             .then(|| OnlineGuard::new(&self.stats, &email, address_string(peer.ip())));
         let base = Base {
+            id,
             index,
             peer,
             local,
@@ -483,6 +539,7 @@ impl Instance {
                     .iter()
                     .any(|o| p.starts_with(o.as_str()) || o.starts_with(p));
             if overrides {
+                tracing::info!("[{}] app/dispatcher: sniffed domain: {domain}", base.id);
                 route_domain = Some(domain.clone());
                 if !sniffing.route_only {
                     dest = Address::Domain(domain);
@@ -501,7 +558,8 @@ impl Instance {
             protocol,
             ..base.ctx(&inbound.tag, udp, port)
         };
-        let Some((outbound, routed)) = self.route(&ctx).await? else {
+        let destination = format!("{}:{dest}:{port}", if ctx.udp { "udp" } else { "tcp" });
+        let Some((outbound, routed)) = self.route(&ctx, base.id, &destination).await? else {
             return Ok(());
         };
         self.access(base, &ctx, &dest, &outbound.tag, routed);
@@ -556,12 +614,17 @@ impl Instance {
                 let target = freedom_target(&dest, port, udp, final_rules, strategy).await;
                 match target {
                     Target::Blocked(rule_delay, shown) => {
-                        let delay = block_delay(rule_delay, &shown, udp);
+                        let delay = block_delay(rule_delay, &shown, udp, base.id);
                         client.drain_for(delay).await
                     }
                     Target::Dial(addrs) if udp => {
                         let addr = *addrs.first().context("failed to resolve destination")?;
                         let socket = udp_connect(addr, &outbound.socket).await?;
+                        tracing::info!(
+                            "[{}] proxy/freedom: connection opened to udp:{dest}:{port}, local endpoint {}, remote endpoint {addr}",
+                            base.id,
+                            socket.local_addr()?
+                        );
                         client
                             .relay_udp(
                                 Datagram::Socket {
@@ -575,17 +638,25 @@ impl Instance {
                             .await
                     }
                     Target::Dial(addrs) => {
+                        tracing::info!(
+                            "[{}] transport/internet/tcp: dialing TCP to tcp:{dest}:{port}",
+                            base.id
+                        );
                         let remote = connect(&addrs, &outbound.socket).await?;
                         if let Address::Domain(_) = dest
                             && let Some((delay, shown)) =
                                 blocked(remote.peer_addr()?, udp, final_rules)
                         {
                             drop(remote);
-                            tracing::warn!(
-                                "target blocked by a finalrule: tcp:{shown}, blackholing connection"
-                            );
-                            return client.drain_for(Duration::from_secs(delay.0)).await;
+                            let delay = block_delay(delay, &shown, udp, base.id);
+                            return client.drain_for(delay).await;
                         }
+                        tracing::info!(
+                            "[{}] proxy/freedom: connection opened to tcp:{dest}:{port}, local endpoint {}, remote endpoint {}",
+                            base.id,
+                            remote.local_addr()?,
+                            remote.peer_addr()?
+                        );
                         remote.set_nodelay(true).ok();
                         client
                             .relay_tcp(Counted::new(remote, out_down, out_up), policy)
@@ -598,6 +669,12 @@ impl Instance {
                 let policy = self.config.policy.level(server.level);
                 let counters = (out_up, out_down);
                 if udp {
+                    tracing::info!(
+                        "[{}] proxy/vless/outbound: tunneling request to udp:{dest}:{port} via {}:{}",
+                        base.id,
+                        server.address,
+                        server.port
+                    );
                     let tunnel = tokio::time::timeout(
                         policy.handshake,
                         server.open_udp(&outbound.socket, &dest, port, counters),
@@ -628,6 +705,12 @@ impl Instance {
                         }
                     }
                 }
+                tracing::info!(
+                    "[{}] proxy/vless/outbound: tunneling request to tcp:{dest}:{port} via {}:{}",
+                    base.id,
+                    server.address,
+                    server.port
+                );
                 let remote = tokio::time::timeout(
                     policy.handshake,
                     server.open_tcp(&outbound.socket, &dest, port, &first, counters),
@@ -659,7 +742,8 @@ impl Instance {
             },
             ..base.ctx(tag, true, port)
         };
-        let Some((outbound, routed)) = self.route(&ctx).await? else {
+        let destination = format!("{}:{dest}:{port}", if ctx.udp { "udp" } else { "tcp" });
+        let Some((outbound, routed)) = self.route(&ctx, base.id, &destination).await? else {
             return Ok(());
         };
         self.access(base, &ctx, &dest, &outbound.tag, routed);
@@ -684,12 +768,17 @@ impl Instance {
                 strategy,
             } => match freedom_target(&dest, port, true, final_rules, strategy).await {
                 Target::Blocked(rule_delay, shown) => {
-                    link.drain_for(block_delay(rule_delay, &shown, true), base)
+                    link.drain_for(block_delay(rule_delay, &shown, true, base.id), base)
                         .await
                 }
                 Target::Dial(addrs) => {
                     let default = *addrs.first().context("failed to resolve destination")?;
                     let socket = udp_bind(&outbound.socket).await?;
+                    tracing::info!(
+                        "[{}] proxy/freedom: connection opened to udp:{dest}:{port}, local endpoint {}, remote endpoint {default}",
+                        base.id,
+                        socket.local_addr()?
+                    );
                     let out = PacketOut::Freedom {
                         v6: socket.local_addr()?.is_ipv6(),
                         socket,
@@ -703,6 +792,12 @@ impl Instance {
             },
             OutboundKind::Vless(server) => {
                 let handshake = self.config.policy.level(server.level).handshake;
+                tracing::info!(
+                    "[{}] proxy/vless/outbound: tunneling request to udp:{dest}:{port} via {}:{}",
+                    base.id,
+                    server.address,
+                    server.port
+                );
                 let tunnel = tokio::time::timeout(
                     handshake,
                     server.open_udp(&outbound.socket, &dest, port, (out_up, out_down)),
@@ -715,8 +810,14 @@ impl Instance {
     }
 
     /// The outbound and whether a rule picked it; `None` when a rule names a missing outbound.
-    async fn route(&self, ctx: &Ctx) -> Result<Option<(&Outbound, bool)>> {
+    async fn route(
+        &self,
+        ctx: &Ctx,
+        id: u32,
+        destination: &str,
+    ) -> Result<Option<(&Outbound, bool)>> {
         let Some(rule) = self.config.router.pick(ctx).await else {
+            tracing::info!("[{id}] app/dispatcher: default route for {destination}");
             let default = self.config.outbounds.first();
             return Ok(Some((
                 default.context("default outbound handler not exist")?,
@@ -730,9 +831,14 @@ impl Instance {
             .find(|o| o.tag == rule.outbound)
         {
             Some(o) => {
-                if !rule.tag.is_empty() {
+                if rule.tag.is_empty() {
                     tracing::info!(
-                        "Hit route rule: [{}] so taking detour [{}]",
+                        "[{id}] app/dispatcher: taking detour [{}] for [{destination}]",
+                        o.tag
+                    );
+                } else {
+                    tracing::info!(
+                        "[{id}] app/dispatcher: Hit route rule: [{}] so taking detour [{}] for [{destination}]",
                         rule.tag,
                         o.tag
                     );
@@ -741,7 +847,10 @@ impl Instance {
             }
             None => {
                 // DO NOT CHANGE (Go): a missing tag must not fall back to the default outbound.
-                tracing::warn!("non existing outTag: {}", rule.outbound);
+                tracing::warn!(
+                    "[{id}] app/dispatcher: non existing outTag: {}",
+                    rule.outbound
+                );
                 Ok(None)
             }
         }
@@ -872,10 +981,11 @@ fn blocked(addr: SocketAddr, udp: bool, rules: &[FinalRule]) -> Option<((u64, u6
         .then(|| ((30, 90), addr.to_string()))
 }
 
-fn block_delay((min, max): (u64, u64), shown: &str, udp: bool) -> Duration {
+fn block_delay((min, max): (u64, u64), shown: &str, udp: bool, id: u32) -> Duration {
     let delay = min + rand_below(max.saturating_sub(min) + 1);
-    tracing::warn!(
-        "target blocked by a finalrule: {}:{shown}, blackholing connection for {delay}s",
+    // FinalRule.log defaults to Info.
+    tracing::info!(
+        "[{id}] proxy/freedom: target blocked by a finalrule: {}:{shown}, blackholing connection for {delay}s",
         if udp { "udp" } else { "tcp" }
     );
     Duration::from_secs(delay)
@@ -1571,7 +1681,7 @@ mod continuation_tests {
         drop(remote);
         assert!(
             me.clone()
-                .vless_conn(0, Box::new(io), peer, peer, None)
+                .vless_conn(0, Box::new(io), peer, peer, None, 1)
                 .await
                 .is_ok()
         );
@@ -1579,7 +1689,7 @@ mod continuation_tests {
         remote.write_all(&[0]).await.unwrap();
         drop(remote);
         assert!(
-            me.vless_conn(0, Box::new(io), peer, peer, None)
+            me.vless_conn(0, Box::new(io), peer, peer, None, 1)
                 .await
                 .is_err()
         );
@@ -1607,7 +1717,7 @@ mod continuation_tests {
         let peer = "127.0.0.1:12346".parse().unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            me.vless_conn(0, Box::new(io), peer, peer, None),
+            me.vless_conn(0, Box::new(io), peer, peer, None, 1),
         )
         .await
         .expect("outbound handshake ignored its policy")

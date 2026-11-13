@@ -211,10 +211,12 @@ pub(crate) fn forwarded_for(
     }
     if trusted.is_empty() {
         tracing::warn!(
-            "received \"X-Forwarded-For\" from {remote} but \"sockopt.trustedXForwardedFor\" is not configured; ignoring it and using the real remote address"
+            "common/protocol/http: received \"X-Forwarded-For\" from {remote} but \"sockopt.trustedXForwardedFor\" is not configured; ignoring it and using the real remote address"
         );
     } else {
-        tracing::error!("ignored potentially forged \"X-Forwarded-For\" from {remote}: {value}");
+        tracing::error!(
+            "common/protocol/http: ignored potentially forged \"X-Forwarded-For\" from {remote}: {value}"
+        );
     }
     remote
 }

@@ -371,7 +371,7 @@ impl Webhook {
         let hook = self.clone();
         tokio::spawn(async move {
             if let Err(error) = hook.post(event.to_string()).await {
-                tracing::warn!(%error, "routing webhook failed");
+                tracing::warn!("app/router: routing webhook failed > {error:#}");
             }
         });
     }
