@@ -88,6 +88,26 @@ const KEYS: &[&str] = &[
     "extra",
 ];
 
+/// encoding/json into SplitHTTPConfig: keys match the fields case-insensitively and names that
+/// are not fields are dropped, as Go ignores them.
+fn go_fields(v: &Value) -> Value {
+    let Some(object) = v.as_object() else {
+        return v.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (key, value) in object {
+        let Some(field) = KEYS.iter().find(|f| f.eq_ignore_ascii_case(key)) else {
+            continue;
+        };
+        // shortcut: Go keeps the last of two case variants in document order; serde_json
+        // does not keep that order, so the exact spelling wins here.
+        if key == field || !out.contains_key(*field) {
+            out.insert((*field).to_owned(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
 /// conf.Int32Range: an integer or "from-to" string (also "-1--5"), ordered.
 fn range(v: &Value, path: &str) -> Result<(i64, i64)> {
     let (a, b) = match v {
@@ -127,20 +147,15 @@ fn range(v: &Value, path: &str) -> Result<(i64, i64)> {
 impl Config {
     /// SplitHTTPConfig.Build plus the server-side Get* normalizations.
     pub fn parse(settings: &Value, path: &str) -> Result<Self> {
-        crate::config::keys(settings, KEYS, path)?;
+        let settings = &go_fields(settings);
         for key in ["host", "path", "mode"] {
             ensure!(
                 settings[key].is_null() || settings[key].is_string(),
                 "{path}.{key} must be a string"
             );
         }
-        let extra = &settings["extra"];
-        let c = if extra.is_null() {
-            settings
-        } else {
-            crate::config::keys(extra, KEYS, &format!("{path}.extra"))?;
-            extra
-        };
+        let extra = &go_fields(&settings["extra"]);
+        let c = if extra.is_null() { settings } else { extra };
         let s = |key: &str| -> Result<String> {
             match &c[key] {
                 Value::Null => Ok(String::new()),
@@ -240,6 +255,40 @@ impl Config {
             "X-Session",
         );
         let seq_key = key_for(&seq_placement, s("seqKey")?, "x_seq", "X-Seq");
+        // sessionIDTable/sessionIDLength only shape client IDs, but Go validates them on load.
+        let table = s("sessionIDTable")?;
+        if !table.is_empty() {
+            let size = match table.as_str() {
+                "ALPHABET" | "alphabet" => 26,
+                "Alphabet" => 52,
+                "BASE36" | "base36" => 36,
+                "Base62" => 62,
+                "HEX" | "hex" => 16,
+                "number" => 10,
+                custom => {
+                    ensure!(
+                        custom.is_ascii(),
+                        "{path}: sessionIDTable must contain only ASCII characters"
+                    );
+                    custom.len() as u128
+                }
+            };
+            let (from, to) = range(&c["sessionIDLength"], &format!("{path}.sessionIDLength"))?;
+            // roomSize: the number of possible IDs must reach 2^31.
+            let mut room = 0u128;
+            for k in from..=to {
+                let term = if k <= 0 { 1 } else { size.checked_pow(k as u32).unwrap_or(u128::MAX) };
+                room = room.saturating_add(term);
+                if room >= 2 << 30 {
+                    break;
+                }
+            }
+            ensure!(
+                room >= 2 << 30,
+                "{path}: sessionIDTable or sessionIDLength is too small"
+            );
+            ensure!(from > 0, "{path}: sessionIDLength.from must be greater than 0");
+        }
         let data_key = match (data_placement.as_str(), s("uplinkDataKey")?) {
             ("body", _) => String::new(),
             (_, k) if !k.is_empty() => k,
@@ -1523,7 +1572,9 @@ mod tests {
             json!({"headers": {"Host": "a"}}),
             json!({"xmux": {"maxConnections": 2, "maxConcurrency": 2}}),
             json!({"xPaddingBytes": "a-b"}),
-            json!({"unknown": 1}),
+            json!({"sessionIDTable": "hex", "sessionIDLength": 4}),
+            json!({"sessionidtable": "number", "sessionIDLength": "0-12"}),
+            json!({"sessionIDTable": "абв", "sessionIDLength": 30}),
             json!({"scMaxEachPostBytes": -1}),
             json!({"scMaxEachPostBytes": 67_108_865}),
             json!({"serverMaxHeaderBytes": 4_294_967_296u64}),
@@ -1537,6 +1588,19 @@ mod tests {
         ] {
             assert!(Config::parse(&bad, "x").is_err(), "{bad}");
         }
+        // Keys match case-insensitively; names that are not Go fields (older spellings
+        // included) are ignored, as encoding/json does.
+        let lenient = Config::parse(
+            &json!({"SessionIDTable": "Base62", "sessionIDLength": "20", "sessionKey": "auth",
+                    "sessionPlacement": "query", "scMaxPacketPayload": 15000, "SEQKEY": "n",
+                    "seqPlacement": "query"}),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(
+            (lenient.session_placement.as_str(), lenient.seq_key.as_str()),
+            ("path", "n")
+        );
         assert_eq!(range(&json!("-5--1"), "r").unwrap(), (-5, -1));
         assert_eq!(range(&json!("80-50"), "r").unwrap(), (50, 80));
     }
