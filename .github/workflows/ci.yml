@@ -21,9 +21,12 @@ jobs:
       - run: cargo build --locked --workspace
       - name: Download and verify pinned Xray
         run: python3 scripts/fetch_xray.py --output /tmp/xray
+      - name: Download and verify pinned Mihomo
+        run: python3 scripts/fetch_mihomo.py --output /tmp/mihomo
       - name: Real Xray tests
         env:
           XRAY_BINARY: /tmp/xray/xray
+          MIHOMO_BINARY: /tmp/mihomo/mihomo
         run: cargo test --locked --workspace -- --include-ignored
       - run: python3 scripts/smoke.py --binary target/debug/remnanode-rust --xray /tmp/xray/xray
       - name: Smoke test with the Rust core

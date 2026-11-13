@@ -61,6 +61,8 @@ async fn setup(
     dir: &Path,
     xray: &str,
     xhttp: Option<serde_json::Value>,
+    fingerprint: &str,
+    mihomo_hybrid: Option<bool>,
 ) -> Result<(Vec<Child>, u16)> {
     let cert = dir.join("target.pem");
     let key = dir.join("target.key");
@@ -89,7 +91,15 @@ async fn setup(
         "certificate: {}",
         String::from_utf8_lossy(&certificate.stderr)
     );
-    let (target_port, server_port, socks_port) = (free_port(), free_port(), free_port());
+    let target_hold = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let server_hold = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let socks_hold = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let (target_port, server_port, socks_port) = (
+        target_hold.local_addr()?.port(),
+        server_hold.local_addr()?.port(),
+        socks_hold.local_addr()?.port(),
+    );
+    drop(target_hold);
     let target = spawn_logged(
         Command::new("openssl")
             .args([
@@ -128,18 +138,34 @@ async fn setup(
             "settings": {"flow": flow, "clients": [{"id": ID, "email": "vision"}], "decryption": "none"},
             "streamSettings": {"network": network, "xhttpSettings": xhttp, "security": "reality", "realitySettings": {
                 "target": format!("127.0.0.1:{target_port}"), "serverNames": [SNI],
-                "privateKey": b64.encode(private), "shortIds": ["0123abcd"]}}}],
+                "privateKey": b64.encode(private), "shortIds": ["0123abcd"], "show":true}}}],
         "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]}}]
     });
-    let client = json!({"log": {"loglevel": "debug"},
+    let mut client = json!({"log": {"loglevel": "debug"},
         "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "settings": {"udp": true, "ip": "127.0.0.1"}}],
         "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": server_port,
             "users": [{"id": ID, "encryption": "none", "flow": flow}]}]},
             "streamSettings": {"network": network, "xhttpSettings": xhttp, "security": "reality", "realitySettings": {
-                "serverName": SNI, "password": b64.encode(public.as_bytes()), "shortId": "0123abcd", "fingerprint": "chrome"}}}]
+                "serverName": SNI, "password": b64.encode(public.as_bytes()), "shortId": "0123abcd", "fingerprint": fingerprint}}}]
     });
+    if let Some(hybrid) = mihomo_hybrid {
+        client = json!({"socks-port": socks_port, "bind-address":"127.0.0.1", "allow-lan":false,
+            "mode":"rule", "log-level":"debug", "rules":["MATCH,proxy"],
+            "proxies":[{"name":"proxy", "type":"vless", "server":"127.0.0.1", "port":server_port,
+                "uuid":ID, "tls":true, "servername":SNI, "client-fingerprint":fingerprint,
+                "flow":flow, "udp":true, "packet-encoding":"xudp",
+                "reality-opts":{"public-key":b64.encode(public.as_bytes()), "short-id":"0123abcd"}}]});
+        if hybrid {
+            client["proxies"][0]["reality-opts"]["support-x25519mlkem768"] = json!(true);
+        }
+        if network == "xhttp" {
+            client["proxies"][0]["network"] = json!("xhttp");
+            client["proxies"][0]["xhttp-opts"] = xhttp.clone();
+        }
+    }
     std::fs::write(dir.join("server.json"), server.to_string())?;
     std::fs::write(dir.join("client.json"), client.to_string())?;
+    drop(server_hold);
     let server = spawn_logged(
         Command::new(env!("CARGO_BIN_EXE_rcore"))
             .args(["run", "-config"])
@@ -147,15 +173,39 @@ async fn setup(
         dir,
         "rcore",
     )?;
-    let client = spawn_logged(
-        Command::new(xray)
-            .args(["run", "-config"])
-            .arg(dir.join("client.json")),
-        dir,
-        "xray",
-    )?;
+    let mut command = Command::new(xray);
+    if mihomo_hybrid.is_some() {
+        command
+            .env("MIHOMO_TEST_READY", dir.join("mihomo.ready"))
+            .args(["-post-up", ": > \"$MIHOMO_TEST_READY\""])
+            .arg("-d")
+            .arg(dir)
+            .arg("-f");
+    } else {
+        command.args(["run", "-config"]);
+    }
+    drop(socks_hold);
+    let mut client = spawn_logged(command.arg(dir.join("client.json")), dir, "xray")?;
     wait_port(server_port).await?;
-    wait_port(socks_port).await?;
+    if mihomo_hybrid.is_some() {
+        // Mihomo accepts SOCKS before OnRunning; its post-up hook runs after initialization.
+        for _ in 0..100 {
+            ensure!(
+                client.try_wait()?.is_none(),
+                "Mihomo exited before initialization"
+            );
+            if dir.join("mihomo.ready").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        ensure!(
+            dir.join("mihomo.ready").exists(),
+            "Mihomo did not finish initialization"
+        );
+    } else {
+        wait_port(socks_port).await?;
+    }
     Ok((vec![target, server, client], socks_port))
 }
 
@@ -200,7 +250,7 @@ async fn plaintext(socks: u16) -> Result<()> {
     Ok(())
 }
 
-async fn inner_tls(dir: &Path, socks: u16, version: &str) -> Result<()> {
+async fn inner_tls(dir: &Path, socks: u16, version: &str, go_trace: bool) -> Result<()> {
     let port = free_port();
     let mut server = Command::new("openssl")
         .args([
@@ -258,12 +308,44 @@ async fn inner_tls(dir: &Path, socks: u16, version: &str) -> Result<()> {
     request.extend_from_slice(&upload);
     let expected_request = request.clone();
     let mut client_in = client.stdin.take().context("client stdin")?;
+    let mut server_out = server.stdout.take().context("server stdout")?;
+    let mut server_in = server.stdin.take().context("server stdin")?;
+    let mut client_out = client.stdout.take().context("client stdout")?;
+    // Isolated TLS records exercise Vision's complete-record heuristic before bulk writes.
+    for warmup in [b"warmup".as_slice(), b"after-handshake"] {
+        client_in.write_all(warmup).await?;
+        let mut received = vec![0; warmup.len()];
+        server_out.read_exact(&mut received).await?;
+        ensure!(received == warmup, "TLS warmup upload corrupted");
+        server_in.write_all(warmup).await?;
+        client_out.read_exact(&mut received).await?;
+        ensure!(received == warmup, "TLS warmup download corrupted");
+    }
+    if go_trace && version == "-tls1_3" {
+        // Go's asynchronous debug logger can drop markers during the subsequent bulk burst.
+        let mut direct = false;
+        for _ in 0..100 {
+            let log = std::fs::read_to_string(dir.join("xray.log"))?;
+            if log
+                .lines()
+                .any(|l| l.contains("XtlsPadding ") && l.ends_with(" 2"))
+                && log.contains("command 2")
+            {
+                direct = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        ensure!(
+            direct,
+            "TLS 1.3 warmup did not switch both directions to direct copy"
+        );
+    }
     let sending = tokio::spawn(async move {
         client_in.write_all(&request).await?;
         Ok::<_, std::io::Error>(client_in)
     });
     let mut received_request = vec![0; expected_request.len()];
-    let mut server_out = server.stdout.take().context("server stdout")?;
     server_out
         .read_exact(&mut received_request)
         .await
@@ -280,17 +362,13 @@ async fn inner_tls(dir: &Path, socks: u16, version: &str) -> Result<()> {
     .into_bytes();
     response.extend_from_slice(&download);
     let expected_response = response.clone();
-    let mut server_in = server.stdin.take().context("server stdin")?;
     let sending = tokio::spawn(async move {
         server_in.write_all(&response).await?;
         // Keep OpenSSL alive until the receiving side has consumed the response.
         Ok::<_, std::io::Error>(server_in)
     });
     let mut received_response = vec![0; expected_response.len()];
-    client
-        .stdout
-        .take()
-        .context("client stdout")?
+    client_out
         .read_exact(&mut received_response)
         .await
         .context("inner TLS download")?;
@@ -310,6 +388,9 @@ async fn inner_tls(dir: &Path, socks: u16, version: &str) -> Result<()> {
     );
     forwarding.abort();
     let log = std::fs::read_to_string(dir.join("xray.log"))?;
+    if !go_trace {
+        return Ok(());
+    }
     if version == "-tls1_3" {
         ensure!(
             log.lines()
@@ -339,11 +420,22 @@ enum Check {
     InnerTls(&'static str),
     Xudp,
     Xhttp(&'static str),
+    Mihomo {
+        fingerprint: &'static str,
+        hybrid: bool,
+        mode: Option<&'static str>,
+    },
+    LegacyXray,
 }
 
 async fn run(check: Check) {
-    let Ok(xray) = std::env::var("XRAY_BINARY") else {
-        eprintln!("XRAY_BINARY not set: skipped");
+    let binary = if matches!(check, Check::Mihomo { .. }) {
+        "MIHOMO_BINARY"
+    } else {
+        "XRAY_BINARY"
+    };
+    let Ok(xray) = std::env::var(binary) else {
+        eprintln!("{binary} not set: skipped");
         return;
     };
     if Command::new("openssl")
@@ -359,9 +451,21 @@ async fn run(check: Check) {
     let result = tokio::time::timeout(Duration::from_secs(45), async {
         let xhttp = match check {
             Check::Xhttp(mode) => Some(json!({"mode": mode, "path": "/xh"})),
+            Check::Mihomo {
+                mode: Some(mode), ..
+            } => Some(json!({"mode":mode, "path":"/xh"})),
             _ => None,
         };
-        let (_processes, socks) = setup(dir.path(), &xray, xhttp)
+        let (fingerprint, mihomo_hybrid) = match check {
+            Check::Mihomo {
+                fingerprint,
+                hybrid,
+                ..
+            } => (fingerprint, Some(hybrid)),
+            Check::LegacyXray => ("edge", None),
+            _ => ("chrome", None),
+        };
+        let (_processes, socks) = setup(dir.path(), &xray, xhttp, fingerprint, mihomo_hybrid)
             .await
             .context("Vision fixture")?;
         match check {
@@ -369,7 +473,21 @@ async fn run(check: Check) {
                 plaintext(socks).await?;
                 common::xudp_checks(socks).await
             }
-            Check::InnerTls(version) => inner_tls(dir.path(), socks, version).await,
+            Check::InnerTls(version) => inner_tls(dir.path(), socks, version, true).await,
+            Check::Mihomo { mode, .. } => {
+                common::tcp_checks(socks).await.context("Mihomo TCP")?;
+                common::xudp_checks(socks).await.context("Mihomo XUDP")?;
+                if mode.is_none() {
+                    inner_tls(dir.path(), socks, "-tls1_3", false)
+                        .await
+                        .context("Mihomo inner TLS 1.3")?;
+                    inner_tls(dir.path(), socks, "-tls1_2", false)
+                        .await
+                        .context("Mihomo inner TLS 1.2")?;
+                }
+                Ok(())
+            }
+            Check::LegacyXray => common::tcp_checks(socks).await,
             Check::Plaintext => plaintext(socks).await,
             // Vision clients send all UDP (DNS, QUIC) as XUDP inside mux.cool.
             Check::Xudp => common::xudp_checks(socks).await,
@@ -437,4 +555,89 @@ async fn xhttp_reality_h2_packet_up() {
 #[tokio::test(flavor = "multi_thread")]
 async fn vision_xudp_full_cone_udp() {
     run(Check::Xudp).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_legacy_chrome_vision() {
+    run(Check::Mihomo {
+        fingerprint: "chrome",
+        hybrid: false,
+        mode: None,
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_legacy_firefox_vision() {
+    run(Check::Mihomo {
+        fingerprint: "firefox",
+        hybrid: false,
+        mode: None,
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_legacy_edge_vision() {
+    run(Check::Mihomo {
+        fingerprint: "edge",
+        hybrid: false,
+        mode: None,
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_legacy_ios_vision() {
+    run(Check::Mihomo {
+        fingerprint: "ios",
+        hybrid: false,
+        mode: None,
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_modern_chrome_hybrid_vision() {
+    run(Check::Mihomo {
+        fingerprint: "chrome",
+        hybrid: true,
+        mode: None,
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_legacy_xhttp_stream_one() {
+    run(Check::Mihomo {
+        fingerprint: "chrome",
+        hybrid: false,
+        mode: Some("stream-one"),
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_legacy_xhttp_stream_up() {
+    run(Check::Mihomo {
+        fingerprint: "chrome",
+        hybrid: false,
+        mode: Some("stream-up"),
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mihomo_legacy_xhttp_packet_up() {
+    run(Check::Mihomo {
+        fingerprint: "chrome",
+        hybrid: false,
+        mode: Some("packet-up"),
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xray_legacy_edge_vision() {
+    run(Check::LegacyXray).await;
 }

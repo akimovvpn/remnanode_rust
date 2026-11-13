@@ -89,13 +89,19 @@ pub async fn socks_connect(socks: u16, target: u16) -> Result<TcpStream> {
     let mut stream = TcpStream::connect(("127.0.0.1", socks)).await?;
     stream.write_all(&[5, 1, 0]).await?;
     let mut greeting = [0; 2];
-    stream.read_exact(&mut greeting).await?;
+    stream
+        .read_exact(&mut greeting)
+        .await
+        .context("SOCKS greeting")?;
     ensure!(greeting == [5, 0], "SOCKS greeting: {greeting:?}");
     let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
     request.extend_from_slice(&target.to_be_bytes());
     stream.write_all(&request).await?;
     let mut reply = [0; 10];
-    stream.read_exact(&mut reply).await?;
+    stream
+        .read_exact(&mut reply)
+        .await
+        .context("SOCKS CONNECT reply")?;
     ensure!(reply[1] == 0, "SOCKS connect reply: {reply:?}");
     Ok(stream)
 }
@@ -120,13 +126,16 @@ pub async fn tcp_checks(socks: u16) -> Result<()> {
             });
         }
     });
-    let mut s = socks_connect(socks, port).await?;
+    let mut s = socks_connect(socks, port)
+        .await
+        .context("TCP SOCKS connect")?;
     for message in [&b"ping"[..], b"second message", &[7u8; 3000]] {
         s.write_all(message).await?;
         let mut back = vec![0u8; message.len()];
         tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut back))
             .await
-            .context("echo timeout")??;
+            .context("echo timeout")?
+            .context("TCP echo response")?;
         ensure!(back == message, "echo mismatch");
     }
     let big: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8).collect();

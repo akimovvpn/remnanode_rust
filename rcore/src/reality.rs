@@ -292,26 +292,21 @@ fn version_value(v: &[u8; 3]) -> u32 {
 /// REALITY authentication of a ClientHello (tls.go): X25519(privateKey, client share) ->
 /// HKDF-SHA256(random[:20], "REALITY") -> AES-256-GCM-open(session_id, AAD = hello with session_id zeroed).
 pub fn authenticate(config: &Config, hello: &ClientHello) -> Option<[u8; 32]> {
-    let (mut pub1, mut pub2) = (None, None);
-    for (group, data) in &hello.key_shares {
-        if *group == X25519_MLKEM768 && data.len() == MLKEM768_EK + 32 {
-            if pub2.is_some() {
-                pub2 = None;
-                break;
-            }
-            pub2 = Some(&data[MLKEM768_EK..]);
-            continue;
-        }
-        if *group == X25519 && data.len() == 32 {
-            if pub1.is_some() {
-                pub2 = None;
-                break;
-            }
-            pub1 = Some(&data[..]);
-            break;
-        }
-    }
-    let peer: [u8; 32] = pub1.or(Some(pub2?))?.try_into().ok()?;
+    // Approved compatibility exception: Go REALITY 9234c772ba8f key selection (see docs/MIHOMO.md).
+    let peer = hello
+        .key_shares
+        .iter()
+        .find_map(|(group, data)| (*group == X25519 && data.len() == 32).then_some(data.as_slice()))
+        .or_else(|| {
+            hello.key_shares.iter().find_map(|(group, data)| {
+                if *group == X25519_MLKEM768 && data.len() == MLKEM768_EK + 32 {
+                    Some(&data[MLKEM768_EK..])
+                } else {
+                    None
+                }
+            })
+        })?;
+    let peer: [u8; 32] = peer.try_into().ok()?;
     let secret = x25519_dalek::StaticSecret::from(config.private_key);
     let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(peer));
     if !shared.was_contributory() {
@@ -797,37 +792,6 @@ mod tests {
         assert_eq!(&cert[cert.len() - 67..cert.len() - 64], &[0x03, 0x41, 0x00]);
         assert!(cert.windows(15).any(|w| w == b"00010101000000Z"));
     }
-
-    #[test]
-    fn rejects_client_hello_without_hybrid_share_first() {
-        let config = Config {
-            dest: String::new(),
-            server_names: HashSet::new(),
-            private_key: [1; 32],
-            short_ids: HashSet::from([[0; 8]]),
-            min_client_ver: None,
-            max_client_ver: None,
-            max_time_diff: Duration::ZERO,
-            show: false,
-            profiles: Default::default(),
-        };
-        let hello = ClientHello {
-            original: vec![0; 80],
-            random: [0; 32],
-            session_id: vec![0; 32],
-            server_name: String::new(),
-            tls13: true,
-            key_shares: vec![
-                (X25519, vec![9; 32]),
-                (X25519_MLKEM768, vec![9; MLKEM768_EK + 32]),
-            ],
-            alpn: Vec::new(),
-        };
-        assert!(
-            authenticate(&config, &hello).is_none(),
-            "X25519 before X25519MLKEM768 must be rejected"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -888,6 +852,79 @@ mod authentication_tests {
             alpn: Vec::new(),
         };
         (config, hello, auth_key)
+    }
+
+    #[test]
+    fn authenticates_legacy_mihomo_without_hybrid_share() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let (mut config, mut hello, key) = authorized_hello(now, [1, 8, 2], [1; 8]);
+        hello.key_shares.retain(|(group, _)| *group == X25519);
+        assert_eq!(authenticate(&config, &hello), Some(key));
+        config.min_client_ver = Some([1, 8, 3]);
+        assert!(authenticate(&config, &hello).is_none());
+        config.min_client_ver = None;
+        config.max_client_ver = Some([1, 8, 1]);
+        assert!(authenticate(&config, &hello).is_none());
+        let (mut config, mut hello, _) = authorized_hello(now - 120, [1, 8, 2], [1; 8]);
+        hello.key_shares.retain(|(group, _)| *group == X25519);
+        assert!(authenticate(&config, &hello).is_none());
+        config.max_time_diff = Duration::ZERO;
+        assert!(authenticate(&config, &hello).is_some());
+        config.short_ids.clear();
+        assert!(authenticate(&config, &hello).is_none());
+        config.short_ids.insert([1; 8]);
+        hello.original[0] ^= 1;
+        assert!(authenticate(&config, &hello).is_none());
+    }
+
+    #[test]
+    fn authentication_prefers_standalone_key_in_both_share_orders() {
+        let (config, mut hello, key) = authorized_hello(0, [1, 8, 2], [0; 8]);
+        let config = Config {
+            max_time_diff: Duration::ZERO,
+            ..config
+        };
+        let valid = hello.key_shares[1].1.clone();
+        hello.key_shares[0].1[MLKEM768_EK..].fill(9);
+        assert_eq!(authenticate(&config, &hello), Some(key));
+        hello.key_shares.reverse();
+        assert_eq!(authenticate(&config, &hello), Some(key));
+        // The hybrid key is not retried if authentication with the standalone key fails.
+        hello.key_shares[0].1.fill(9);
+        hello.key_shares[1].1[MLKEM768_EK..].copy_from_slice(&valid);
+        assert!(authenticate(&config, &hello).is_none());
+    }
+
+    #[test]
+    fn authentication_uses_first_valid_length_key_and_checks_contributory_secret() {
+        let (config, hello, key) = authorized_hello(0, [1, 8, 2], [0; 8]);
+        let config = Config {
+            max_time_diff: Duration::ZERO,
+            ..config
+        };
+        for index in [0, 1] {
+            let mut h = authorized_hello(0, [1, 8, 2], [0; 8]).1;
+            h.key_shares = vec![
+                (X25519, vec![9; 31]),
+                (X25519_MLKEM768, vec![9; 1215]),
+                h.key_shares[index].clone(),
+            ];
+            assert_eq!(authenticate(&config, &h), Some(key));
+            h.key_shares.push((X25519, vec![9; 32]));
+            if index == 1 {
+                assert_eq!(authenticate(&config, &h), Some(key));
+            } else {
+                assert!(authenticate(&config, &h).is_none());
+            }
+        }
+        let mut h = hello;
+        h.key_shares = vec![(X25519, vec![0; 32])];
+        assert!(authenticate(&config, &h).is_none());
+        h.key_shares.clear();
+        assert!(authenticate(&config, &h).is_none());
     }
     #[test]
     fn authentication_checks_aad_short_id_version_time_and_bounds() {
