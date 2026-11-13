@@ -131,7 +131,7 @@ def main():
             assert status == 200 and data["response"]["isAlive"] is True, (status, data)
             assert request("POST", "/node/handler/add-user", ["not an object"])[0] == 400
             assert request("POST", "/node/stats/get-users-stats", {"reset":"false"})[0] == 400
-            config = {"inbounds":[{"tag":"smoke", "listen":"127.0.0.1", "port":inbound_port, "protocol":"vless", "settings":{"clients":[], "decryption":"none"}}], "outbounds":[{"tag":"direct", "protocol":"freedom"}]}
+            config = {"log":{"loglevel":"info"}, "inbounds":[{"tag":"smoke", "listen":"127.0.0.1", "port":inbound_port, "protocol":"vless", "settings":{"clients":[], "decryption":"none"}}], "outbounds":[{"tag":"direct", "protocol":"freedom"}]}
             start = {"internals":{"hashes":{"emptyConfig":"smoke", "inbounds":[{"tag":"smoke", "usersCount":0, "hash":"0000000000000000"}]}}, "xrayConfig":config}
             status, data = request("POST", "/node/xray/start", start, compressed=True)
             assert status == 200 and data["response"]["isStarted"] is True, (status, data)
@@ -139,6 +139,17 @@ def main():
             user_id = "550e8400-e29b-41d4-a716-446655440000"
             status, data = request("POST", "/node/handler/add-user", {"data":[{"type":"vless", "tag":"smoke", "username":"smoke-user", "uuid":user_id, "flow":""}], "hashData":{"vlessUuid":user_id}})
             assert status == 200 and data["response"]["success"] is True, (status, data)
+            # A valid VLESS request logs its access before the private-target block.
+            header = b"\x00" + bytes.fromhex(user_id.replace("-", "")) + b"\x00\x01\x00\x09\x01\x7f\x00\x00\x01"
+            with socket.create_connection(("127.0.0.1", inbound_port), timeout=5) as traffic:
+                traffic.sendall(header + b"smoke")
+            core_log = Path(env.get("XRAY_LOG_DIR", str(folder / "state" / "xray-logs"))) / "current"
+            for _ in range(100):
+                if core_log.exists() and "email: smoke-user" in core_log.read_text():
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("Core access log missing from the separate log file")
             status, data = request("POST", "/node/stats/get-users-stats", {"reset":False})
             assert status == 200 and isinstance(data["response"]["users"], list), (status, data)
             status, data = request("POST", "/node/handler/remove-user", {"username":"smoke-user", "hashData":{"vlessUuid":user_id}})
@@ -149,7 +160,10 @@ def main():
             assert request("GET", "/node/xray/healthcheck")[1]["response"]["xrayInternalStatusCached"] is False
             mode = (folder / "state" / "config.json").stat().st_mode & 0o777
             assert mode == 0o600, oct(mode)
-            print("PASS: mutual TLS, TLS1.3, SNI, RS256, auth failures, request validation, gzip, real Xray start/add/stats/remove/stop, private config")
+            log.flush()
+            assert "email: smoke-user" not in (folder / "node.log").read_text(), "Core access output leaked into management logs"
+            assert core_log.stat().st_mode & 0o777 == 0o600
+            print("PASS: separate core logs and access output, mutual TLS, TLS1.3, SNI, RS256, auth failures, request validation, gzip, real Xray start/add/stats/remove/stop, private config")
         finally:
             process.terminate()
             try:

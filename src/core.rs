@@ -25,6 +25,7 @@ use crate::{
 
 const API_TAG: &str = "REMNAWAVE_API";
 const API_INBOUND: &str = "REMNAWAVE_API_INBOUND";
+mod log;
 
 pub struct Core {
     pub endpoint: String,
@@ -33,6 +34,7 @@ pub struct Core {
     binary: PathBuf,
     state_dir: PathBuf,
     child: Option<Child>,
+    log_task: Option<tokio::task::JoinHandle<()>>,
     version: Option<String>,
     empty_config_hash: Option<String>,
     webhook_token: String,
@@ -52,6 +54,7 @@ impl Core {
             // Xray only treats absolute paths as unix-socket webhook targets.
             state_dir: std::path::absolute(&state_dir).unwrap_or(state_dir),
             child: None,
+            log_task: None,
             version: None,
             empty_config_hash: None,
             webhook_token: token.iter().map(|b| format!("{b:02x}")).collect(),
@@ -140,6 +143,10 @@ impl Core {
         let config_path = self.state_dir.join("config.json");
         fs::rename(&stage.path, &config_path).context("replace Xray config")?;
         self.stop_child().await?;
+        let log_dir = std::env::var_os("XRAY_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.state_dir.join("xray-logs"));
+        let log = log::Log::open(log_dir)?;
         if let Some(plugins) = plugins {
             plugins.pre_start().await;
         }
@@ -152,12 +159,16 @@ impl Core {
                 .args(["run", "-config"])
                 .arg(&config_path)
                 .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .context("spawn Xray")?,
         );
+        let child = self.child.as_mut().unwrap();
+        self.log_task = Some(tokio::spawn(
+            log.capture(child.stdout.take().unwrap(), child.stderr.take().unwrap()),
+        ));
 
         let ready = self.wait_ready().await;
         if let Err(error) = ready {
@@ -379,6 +390,11 @@ impl Core {
             child.wait().await.context("reap Xray")?;
         }
         self.child = None;
+        if let Some(mut task) = self.log_task.take()
+            && timeout(Duration::from_secs(2), &mut task).await.is_err()
+        {
+            task.abort();
+        }
         Ok(())
     }
 
@@ -1379,6 +1395,23 @@ mod tests {
         assert_eq!(
             std::fs::metadata(state).unwrap().permissions().mode() & 0o777,
             0o700
+        );
+    }
+    #[tokio::test]
+    async fn failed_core_output_is_available_in_separate_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("core");
+        fs::write(&binary, "#!/bin/sh\nif [ \"$2\" = -test ]; then exit 0; fi\necho 'CORE_STDOUT_MARKER'\necho 'CORE_STDERR_MARKER' >&2\nexit 42\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let state = temp.path().join("state");
+        let mut core = Core::new(binary, state.clone(), "http://127.0.0.1:1".into());
+        let response = core.start(&json!({"xrayConfig":{},"internals":{"hashes":{"emptyConfig":"base","inbounds":[]}}})).await.unwrap();
+        assert_eq!(response["isStarted"], false);
+        let log = fs::read_to_string(state.join("xray-logs/current"))
+            .expect("separate core log exists even when startup fails");
+        assert!(
+            log.contains("CORE_STDOUT_MARKER") && log.contains("CORE_STDERR_MARKER"),
+            "{log}"
         );
     }
 }

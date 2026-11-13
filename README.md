@@ -100,7 +100,7 @@ docker compose exec remnanode sh -c 'printf "XRAY_BINARY=%s\n" "${XRAY_BINARY:-/
 docker compose logs --since=5m remnanode
 ```
 
-Startup logs name the selected executable. Failed start requests include the validation/process error; core output is visible in container logs. A successful start logs `Core started and gRPC is ready`. If a Rust profile uses an unsupported feature, the failure names it; use a supported test profile or switch `XRAY_BINARY` back to `/usr/local/bin/xray` and restart through the panel. Do not share `SECRET_KEY` or the contents of the generated config.
+Startup logs name the selected executable. Failed start requests include the validation/process error. Core stdout/stderr is separate: run `docker exec remnanode xlogs` (or `xerrors`). Both follow `/var/log/xray/current` in the image, including rotation. See [logging details](docs/LOGGING.md). A successful start logs `Core started and gRPC is ready`. If a Rust profile uses an unsupported feature, the failure names it; use a supported test profile or switch `XRAY_BINARY` back to `/usr/local/bin/xray` and restart through the panel. Do not share `SECRET_KEY` or the contents of the generated config.
 
 ## Automatic upstream updates
 

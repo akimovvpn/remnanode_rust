@@ -1017,10 +1017,22 @@ impl Config {
             outbounds,
             router,
             log_level: log["loglevel"].as_str().unwrap_or("warning").to_owned(),
-            access_log: log["access"]
-                .as_str()
-                .filter(|s| !s.is_empty() && *s != "none")
-                .map(str::to_owned),
+            access_log: if !log.is_object()
+                || log["access"] == "none"
+                || log["loglevel"]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("none"))
+            {
+                None
+            } else {
+                Some(
+                    log["access"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("/dev/stdout")
+                        .to_owned(),
+                )
+            },
             error_log: log["error"]
                 .as_str()
                 .filter(|s| !s.is_empty() && *s != "none")
@@ -1176,6 +1188,26 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+    #[test]
+    fn access_logs_use_stdout_by_default_and_honor_disabled_or_file_config() {
+        for (log, expected) in [
+            (serde_json::json!(null), None),
+            (serde_json::json!({"loglevel":"info"}), Some("/dev/stdout")),
+            (serde_json::json!({"access":""}), Some("/dev/stdout")),
+            (serde_json::json!({"access":"none"}), None),
+            (
+                serde_json::json!({"loglevel":"none","access":"/tmp/custom"}),
+                None,
+            ),
+            (
+                serde_json::json!({"access":"/tmp/custom"}),
+                Some("/tmp/custom"),
+            ),
+        ] {
+            let parsed = Config::parse(&serde_json::json!({"log":log}).to_string()).unwrap();
+            assert_eq!(parsed.access_log.as_deref(), expected);
         }
     }
 }

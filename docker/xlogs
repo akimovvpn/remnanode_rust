@@ -1,0 +1,2 @@
+#!/bin/sh
+exec tail -n +1 -F "${XRAY_LOG_DIR:-${STATE_DIR:-/var/lib/remnanode}/xray-logs}/current" "$@"

@@ -44,7 +44,11 @@ COPY --from=assets /tmp/xray/xray /usr/local/bin/xray
 COPY --from=assets /tmp/xray/geoip.dat /tmp/xray/geosite.dat /usr/local/share/xray/
 COPY --from=assets /tmp/geocheck /usr/local/bin/geocheck
 COPY --from=assets /tmp/asn-prefixes.json /usr/local/share/asn/asn-prefixes.json
+COPY --chmod=755 docker/xlogs /usr/local/bin/xlogs
+RUN ln -s /usr/local/bin/xlogs /usr/local/bin/xerrors \
+    && touch /var/log/xray/current && chmod 600 /var/log/xray/current
 ENV XRAY_LOCATION_ASSET=/usr/local/share/xray
+ENV XRAY_LOG_DIR=/var/log/xray
 ENV STATE_DIR=/var/lib/remnanode
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/remnanode-rust"]
