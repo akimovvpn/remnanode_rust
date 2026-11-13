@@ -338,6 +338,7 @@ pub struct Inbound {
     /// sockopt.trustedXForwardedFor header names.
     pub trusted_xff: Vec<String>,
     pub reality: Option<std::sync::Arc<crate::reality::Config>>,
+    pub tls: Option<std::sync::Arc<crate::tls_server::Server>>,
 }
 
 /// REALITYConfig.Build (infra/conf/transport_internet.go), server side.
@@ -1201,6 +1202,7 @@ impl Config {
                     "xhttpSettings",
                     "splithttpSettings",
                     "realitySettings",
+                    "tlsSettings",
                     "sockopt",
                 ],
                 &format!("{p}.streamSettings"),
@@ -1243,8 +1245,23 @@ impl Config {
                 }
                 other => return Err(unsupported(&format!("{p}.streamSettings.network {other}"))),
             };
+            let mut tls = None;
             let reality = match stream["security"].as_str().unwrap_or("none") {
                 "none" | "" => None,
+                "tls" => {
+                    let server = crate::tls_server::Server::parse(
+                        &stream["tlsSettings"],
+                        &format!("{p}.streamSettings.tlsSettings"),
+                    )?;
+                    ensure!(
+                        !(matches!(transport, Transport::Xhttp(_))
+                            && server.alpn() == [b"h3".to_vec()]),
+                        "{}",
+                        unsupported(&format!("{p}.streamSettings: XHTTP over HTTP/3 (alpn h3)"))
+                    );
+                    tls = Some(std::sync::Arc::new(server));
+                    None
+                }
                 "reality" => {
                     ensure!(
                         matches!(transport, Transport::Raw | Transport::Xhttp(_)),
@@ -1377,6 +1394,7 @@ impl Config {
                 transport,
                 trusted_xff,
                 reality,
+                tls,
             });
         }
         let mut outbounds = Vec::new();
@@ -1611,11 +1629,13 @@ mod tests {
     }
     #[test]
     fn unported_features_fail_by_name() {
-        let error = Config::parse(r#"{"inbounds":[{"tag":"x","port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"raw","security":"tls"}}]}"#)
+        let error = Config::parse(r#"{"inbounds":[{"tag":"x","port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"raw","security":"xtls"}}]}"#)
             .err()
             .unwrap()
             .to_string();
-        assert!(error.contains("security tls"), "{error}");
+        assert!(error.contains("security xtls"), "{error}");
+        let h3 = r#"{"inbounds":[{"port":443,"protocol":"vless","settings":{"clients":[],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}}]}"#;
+        assert!(Config::parse(h3).err().unwrap().to_string().contains("HTTP/3"));
         assert!(Config::parse(r#"{"dns":{"servers":["1.1.1.1"],"script":"x"}}"#).is_err());
         assert!(Config::parse(r#"{"dns":{"servers":["fakedns"]}}"#).is_err());
         assert!(Config::parse(r#"{"outbounds":[{"protocol":"vmess"}]}"#).is_err());

@@ -369,6 +369,9 @@ impl Instance {
             if let Some(reality) = &inbound.reality {
                 reality.profiles.warm(&reality.dest, &reality.server_names);
             }
+            if let Some(tls) = &inbound.tls {
+                tls.start();
+            }
             let me = self.clone();
             match inbound.kind {
                 InboundKind::Api => {
@@ -416,19 +419,44 @@ impl Instance {
         let inbound = &self.config.inbounds[index];
         let local = stream.local_addr()?;
         stream.set_nodelay(true).ok();
-        let accepted: Result<(BoxIo, SocketAddr, Option<crate::tls13::DirectControl>)> = async {
+        let handshake = self.config.policy.level(0).handshake;
+        // (stream, client address, Vision's switch, outer TLS version when VLESS runs on it).
+        type Accepted = (BoxIo, SocketAddr, Option<crate::tls13::DirectControl>, Option<u16>);
+        let accepted: Result<Accepted> = async {
+            if let Some(tls) = &inbound.tls {
+                let http_hub = !matches!(inbound.transport, Transport::Raw);
+                let tls = tokio::time::timeout(handshake, tls.accept(stream, http_hub))
+                    .await
+                    .context("tls: handshake timeout")??;
+                return Ok(match &inbound.transport {
+                    Transport::Raw => (tls.io, peer, tls.direct, Some(tls.version)),
+                    Transport::Ws {
+                        path,
+                        host,
+                        heartbeat,
+                    } => {
+                        let (io, peer) =
+                            accept_ws(tls.io, peer, path, host, *heartbeat, &inbound.trusted_xff)
+                                .await?;
+                        (io, peer, None, None)
+                    }
+                    Transport::HttpUpgrade { path, host } => {
+                        let (io, peer) =
+                            accept_httpupgrade(tls.io, peer, path, host, &inbound.trusted_xff)
+                                .await?;
+                        (io, peer, None, None)
+                    }
+                    Transport::Xhttp(_) => bail!("XHTTP connections are served by xhttp::serve"),
+                });
+            }
             Ok(match &inbound.transport {
                 Transport::Raw => match &inbound.reality {
                     Some(reality) => {
-                        let (io, direct) = crate::reality::accept(
-                            reality,
-                            stream,
-                            self.config.policy.level(0).handshake,
-                        )
-                        .await?;
-                        (io, peer, Some(direct))
+                        let (io, direct) =
+                            crate::reality::accept(reality, stream, handshake).await?;
+                        (io, peer, Some(direct), Some(0x0304))
                     }
-                    None => (Box::new(stream) as BoxIo, peer, None),
+                    None => (Box::new(stream) as BoxIo, peer, None, None),
                 },
                 Transport::Ws {
                     path,
@@ -436,20 +464,29 @@ impl Instance {
                     heartbeat,
                 } => {
                     let (io, peer) =
-                        accept_ws(stream, path, host, *heartbeat, &inbound.trusted_xff).await?;
-                    (io, peer, None)
+                        accept_ws(stream, peer, path, host, *heartbeat, &inbound.trusted_xff)
+                            .await?;
+                    (io, peer, None, None)
                 }
                 Transport::HttpUpgrade { path, host } => {
                     let (io, peer) =
-                        accept_httpupgrade(stream, path, host, &inbound.trusted_xff).await?;
-                    (io, peer, None)
+                        accept_httpupgrade(stream, peer, path, host, &inbound.trusted_xff).await?;
+                    (io, peer, None, None)
                 }
                 Transport::Xhttp(_) => bail!("XHTTP connections are served by xhttp::serve"),
             })
         }
         .await;
-        let (io, peer, direct) = match accepted {
+        let (io, peer, direct, outer_tls) = match accepted {
             Ok(accepted) => accepted,
+            // Go's lazy handshake fails VLESS's first read, so the session ends with its ID; a
+            // connection closed before any byte stays quiet, like an empty VLESS request.
+            Err(error) if inbound.tls.is_some() && matches!(inbound.transport, Transport::Raw) => {
+                if error.is::<vless::EmptyRequest>() {
+                    return Ok(());
+                }
+                return Err(error);
+            }
             Err(error) => {
                 // Transport hubs reject before a session exists, so Go logs them without an ID.
                 let hub = match &inbound.transport {
@@ -461,10 +498,12 @@ impl Instance {
                 return Ok(());
             }
         };
-        self.vless_conn(index, io, peer, local, direct, id).await
+        self.vless_conn(index, io, peer, local, direct, outer_tls, id)
+            .await
     }
 
     /// A VLESS connection over an established transport (raw/REALITY, WS, HTTPUpgrade, XHTTP).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn vless_conn(
         self: Arc<Self>,
         index: usize,
@@ -472,6 +511,7 @@ impl Instance {
         peer: SocketAddr,
         local: SocketAddr,
         direct: Option<crate::tls13::DirectControl>,
+        outer_tls: Option<u16>,
         id: Sid,
     ) -> Result<()> {
         let inbound = &self.config.inbounds[index];
@@ -518,13 +558,13 @@ impl Instance {
             Err(error) if error.is::<vless::EmptyRequest>() => return Ok(()),
             Err(error) => return Err(error.context(format!("invalid request from {peer}"))),
         };
-        vless::check_flow(&request, inbound.reality.is_some(), &payload)?;
+        vless::check_flow(&request, outer_tls, &payload)?;
         if request.flow == vless::XRV {
             let (io, decoded) = crate::vision::wrap(
                 conn.inner,
                 &payload,
                 request.sent_id,
-                direct.context("Vision requires REALITY")?,
+                direct.context("XTLS only supports TLS and REALITY directly for now.")?,
             )?;
             conn.inner = io;
             payload = decoded;
@@ -2107,7 +2147,7 @@ mod continuation_tests {
         drop(remote);
         assert!(
             me.clone()
-                .vless_conn(0, Box::new(io), peer, peer, None, Sid(1))
+                .vless_conn(0, Box::new(io), peer, peer, None, None, Sid(1))
                 .await
                 .is_ok()
         );
@@ -2115,7 +2155,7 @@ mod continuation_tests {
         remote.write_all(&[0]).await.unwrap();
         drop(remote);
         assert!(
-            me.vless_conn(0, Box::new(io), peer, peer, None, Sid(1))
+            me.vless_conn(0, Box::new(io), peer, peer, None, None, Sid(1))
                 .await
                 .is_err()
         );
@@ -2143,7 +2183,7 @@ mod continuation_tests {
         let peer = "127.0.0.1:12346".parse().unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            me.vless_conn(0, Box::new(io), peer, peer, None, Sid(1)),
+            me.vless_conn(0, Box::new(io), peer, peer, None, None, Sid(1)),
         )
         .await
         .expect("outbound handshake ignored its policy")

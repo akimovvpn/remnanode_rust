@@ -20,6 +20,7 @@ mod socks;
 mod stats;
 mod tls13;
 mod tls_client;
+mod tls_server;
 mod transport;
 mod vision;
 mod vless;

@@ -272,13 +272,19 @@ fn is_mux_and_not_xudp(request: &Request, first: &[u8]) -> bool {
 }
 
 /// Inbound flow checks (inbound.go Process). `outer_tls` is true behind TLS 1.3 / REALITY.
-pub fn check_flow(request: &Request, outer_tls: bool, first: &[u8]) -> Result<()> {
+/// `outer_tls`: the TLS version of a TLS or REALITY connection VLESS runs on directly.
+pub fn check_flow(request: &Request, outer_tls: Option<u16>, first: &[u8]) -> Result<()> {
     let account = uuid_string(request.user.id);
     match request.flow.as_str() {
         XRV if request.user.flow == XRV => {
             ensure!(request.command != Command::Udp, "{XRV} doesn't support UDP");
-            ensure!(outer_tls, "failed to use {XRV}, found outer tls version 0");
-            Ok(())
+            match outer_tls {
+                None => bail!("XTLS only supports TLS and REALITY directly for now."),
+                Some(version) if version != 0x0304 => {
+                    bail!("failed to use {XRV}, found outer tls version {version}")
+                }
+                Some(_) => Ok(()),
+            }
         }
         XRV => bail!("account {account} is not able to use the flow {XRV}"),
         "" => {
@@ -344,7 +350,7 @@ mod tests {
             (Command::Tcp, 443, Address::Domain("example.com".into()))
         );
         assert_eq!(rest, b"hello");
-        check_flow(&req, false, &rest).unwrap();
+        check_flow(&req, None, &rest).unwrap();
         let mut bad = vec![0];
         bad.extend_from_slice(&[8; 16]);
         let error = read_request(&mut bad.as_slice(), &users)
@@ -367,15 +373,15 @@ mod tests {
         };
         // XUDP: session 0, New, network UDP.
         let xudp = [0, 12, 0, 0, 1, 1, 2];
-        check_flow(&request(Command::Mux), true, &xudp).unwrap();
+        check_flow(&request(Command::Mux), Some(0x0304), &xudp).unwrap();
         for first in [
             &[0, 12, 0, 1, 1, 1, 2][..],
             &[0, 12, 0, 0, 1, 1, 1],
             &xudp[..6],
         ] {
-            assert!(check_flow(&request(Command::Mux), true, first).is_err());
+            assert!(check_flow(&request(Command::Mux), Some(0x0304), first).is_err());
         }
-        assert!(check_flow(&request(Command::Tcp), true, b"").is_err());
-        check_flow(&request(Command::Udp), true, b"").unwrap();
+        assert!(check_flow(&request(Command::Tcp), Some(0x0304), b"").is_err());
+        check_flow(&request(Command::Udp), Some(0x0304), b"").unwrap();
     }
 }

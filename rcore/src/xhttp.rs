@@ -1182,7 +1182,7 @@ impl Server {
         tokio::spawn(async move {
             let id = crate::app::session_id();
             tokio::select! {
-                result = me.vless_conn(index, conn, remote, local, None, id) => {
+                result = me.vless_conn(index, conn, remote, local, None, None, id) => {
                     if let Err(error) = result {
                         tracing::info!("{id}app/proxyman/inbound: connection ends > {error:#}");
                     }
@@ -1241,9 +1241,20 @@ pub async fn serve(me: Arc<Instance>, index: usize, listener: TcpListener) {
             };
             let inbound = &server.me.config.inbounds[server.index];
             let max_header = config_header_limit(&inbound.transport);
-            let io: BoxIo = match &inbound.reality {
-                Some(reality) => {
-                    let handshake = server.me.config.policy.level(0).handshake;
+            let handshake = server.me.config.policy.level(0).handshake;
+            let io: BoxIo = match (&inbound.tls, &inbound.reality) {
+                (Some(tls), _) => {
+                    match tokio::time::timeout(handshake, tls.accept(stream, true)).await {
+                        Ok(Ok(accepted)) => accepted.io,
+                        Ok(Err(error)) if error.is::<crate::vless::EmptyRequest>() => return,
+                        Ok(Err(error)) => {
+                            tracing::info!("transport/internet/splithttp: {error:#}");
+                            return;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                (None, Some(reality)) => {
                     match crate::reality::accept(reality, stream, handshake).await {
                         Ok((io, _)) => io,
                         Err(error) => {
@@ -1252,7 +1263,7 @@ pub async fn serve(me: Arc<Instance>, index: usize, listener: TcpListener) {
                         }
                     }
                 }
-                None => Box::new(stream),
+                (None, None) => Box::new(stream),
             };
             let service = hyper::service::service_fn(move |req| {
                 let server = server.clone();

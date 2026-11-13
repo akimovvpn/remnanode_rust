@@ -117,7 +117,7 @@ pub struct ClientHello {
     pub random: [u8; 32],
     session_id: Vec<u8>,
     pub server_name: String,
-    tls13: bool,
+    pub tls13: bool,
     key_shares: Vec<(u16, Vec<u8>)>,
     pub alpn: Vec<String>,
 }

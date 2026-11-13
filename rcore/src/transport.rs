@@ -18,7 +18,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
-    net::TcpStream,
     sync::Mutex,
 };
 
@@ -239,14 +238,14 @@ fn http_status(code: u16, reason: &str, error_body: bool) -> Vec<u8> {
 
 /// Accepts a WebSocket connection like Xray's net/http + gorilla handler. Rejected
 /// requests get Go's responses and the connection stays open for the next request.
-pub async fn accept_ws(
-    mut tcp: TcpStream,
+pub async fn accept_ws<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut tcp: S,
+    remote: SocketAddr,
     path: &str,
     host: &str,
     heartbeat: u32,
     trusted: &[String],
 ) -> Result<(BoxIo, SocketAddr)> {
-    let remote = tcp.peer_addr()?;
     let mut carry = Vec::new();
     loop {
         // ReadHeaderTimeout 4s, MaxHeaderBytes 8192 (+4096 net/http slack).
@@ -327,13 +326,13 @@ pub async fn accept_ws(
 }
 
 /// HTTPUpgrade server (transport/internet/httpupgrade/hub.go upgrade()).
-pub async fn accept_httpupgrade(
-    mut tcp: TcpStream,
+pub async fn accept_httpupgrade<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut tcp: S,
+    remote: SocketAddr,
     path: &str,
     host: &str,
     trusted: &[String],
 ) -> Result<(BoxIo, SocketAddr)> {
-    let remote = tcp.peer_addr()?;
     let (req, rest) = tokio::time::timeout(
         Duration::from_secs(4),
         read_request(&mut tcp, 12288, Vec::new()),

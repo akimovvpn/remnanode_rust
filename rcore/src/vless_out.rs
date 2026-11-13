@@ -511,8 +511,8 @@ mod tests {
         let expected = [header.as_slice(), b"first"].concat();
         let count = expected.len();
         let peer = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let (mut io, _) = crate::transport::accept_ws(tcp, "/", "target.test", 0, &[])
+            let (tcp, from) = listener.accept().await.unwrap();
+            let (mut io, _) = crate::transport::accept_ws(tcp, from, "/", "target.test", 0, &[])
                 .await
                 .unwrap();
             let mut got = vec![0; expected.len()];
