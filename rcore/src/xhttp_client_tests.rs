@@ -7,6 +7,81 @@ use tokio::{net::TcpListener, sync::Notify, time::timeout};
 const DEADLINE: Duration = Duration::from_secs(2);
 
 #[tokio::test]
+async fn separate_download_owns_pool_counters_and_obeys_socket_penetration() {
+    for penetrate in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = local_server(listener.local_addr().unwrap().port());
+        let peer = tokio::spawn(async move {
+            let (io, _) = listener.accept().await.unwrap();
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(io),
+                    service_fn(|request: Request<Incoming>| async move {
+                        assert_eq!(request.method(), http::Method::GET);
+                        assert!(request.uri().path().starts_with("/immediate/"));
+                        Ok::<_, io::Error>(Response::new(Full::new(Bytes::from_static(b"down"))))
+                    }),
+                )
+                .await;
+        });
+        let client = client(json!({"xmux":{"hMaxRequestTimes":9}, "downloadSettings":{
+            "address":"127.0.0.1", "port":server.port, "network":"xhttp",
+            "sockopt":{"interface":"no-such-device"}, "xhttpSettings":{
+                "path":"/immediate", "xmux":{"hMaxRequestTimes":5},
+                "downloadSettings":{"address":"127.0.0.1", "port":1, "network":"xhttp"}
+            }
+        }}));
+        let parsed = crate::config::Config::parse(&json!({"outbounds":[{"protocol":"vless",
+            "settings":{"address":"127.0.0.1", "port":server.port, "id":"00000000-0000-0000-0000-000000000000", "encryption":"none"},
+            "streamSettings":{"sockopt":{"penetrate":penetrate}}
+        }]}).to_string()).unwrap();
+        let mut connection = client
+            .connect(&server, &parsed.outbounds[0].socket)
+            .await
+            .unwrap();
+        let upload = client.manager.lock().unwrap().clients[0].clone();
+        let download_client = &client.config.download.as_ref().unwrap().client;
+        let download = download_client.manager.lock().unwrap().clients[0].clone();
+        assert!(!Arc::ptr_eq(&upload, &download));
+        assert_eq!(upload.running.load(Ordering::Acquire), 1);
+        assert_eq!(download.running.load(Ordering::Acquire), 1);
+        assert_eq!(upload.requests.load(Ordering::Acquire), 9);
+        assert_eq!(download.requests.load(Ordering::Acquire), 4);
+        let mut bytes = [0; 4];
+        let read = timeout(DEADLINE, connection.read_exact(&mut bytes))
+            .await
+            .unwrap();
+        if penetrate {
+            read.unwrap();
+            assert_eq!(&bytes, b"down");
+        } else {
+            assert!(
+                read.is_err(),
+                "child socket options were ignored without penetrate"
+            );
+        }
+        assert!(
+            download_client
+                .config
+                .download
+                .as_ref()
+                .unwrap()
+                .client
+                .manager
+                .lock()
+                .unwrap()
+                .clients
+                .is_empty(),
+            "GET recursively followed the grandchild download"
+        );
+        drop(connection);
+        assert_eq!(upload.running.load(Ordering::Acquire), 0);
+        assert_eq!(download.running.load(Ordering::Acquire), 0);
+        peer.abort();
+    }
+}
+
+#[tokio::test]
 async fn http11_accepts_more_than_one_hundred_response_headers() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server = local_server(listener.local_addr().unwrap().port());

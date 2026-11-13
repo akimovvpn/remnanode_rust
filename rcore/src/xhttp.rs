@@ -155,7 +155,11 @@ impl Config {
             );
         }
         let extra = &go_fields(&settings["extra"]);
-        let c = if extra.is_null() { settings } else { extra };
+        let c = if settings.get("extra").is_none() {
+            settings
+        } else {
+            extra
+        };
         let s = |key: &str| -> Result<String> {
             match &c[key] {
                 Value::Null => Ok(String::new()),
@@ -170,6 +174,14 @@ impl Config {
             m @ ("auto" | "packet-up" | "stream-up" | "stream-one") => m.to_owned(),
             m => bail!("{path}: unsupported mode: {m}"),
         };
+        ensure!(
+            mode != "stream-one" || c["downloadSettings"].is_null(),
+            "Can not use \"downloadSettings\" in \"stream-one\" mode."
+        );
+        ensure!(
+            c["downloadSettings"].is_null() || c["downloadSettings"].is_object(),
+            "{path}.downloadSettings must be an object"
+        );
         for key in ["xPaddingObfsMode", "noSSEHeader", "noGRPCHeader"] {
             ensure!(
                 c[key].is_null() || c[key].is_boolean(),

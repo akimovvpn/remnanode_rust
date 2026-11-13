@@ -5,6 +5,7 @@ use std::os::fd::AsFd;
 pub struct Options {
     pub interface: String,
     pub tcp_fast_open: Option<bool>,
+    pub penetrate: bool,
 }
 
 impl Options {

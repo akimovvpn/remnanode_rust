@@ -344,20 +344,22 @@ pub struct Inbound {
 /// REALITYConfig.Build (infra/conf/transport_internet.go), server side.
 /// conf.Address: an IP literal or a domain.
 fn address(v: &Value, path: &str) -> Result<crate::vless::Address> {
-    let text = v
-        .as_str()
-        .filter(|a| !a.is_empty())
-        .with_context(|| format!("{path} is not set"))?;
-    Ok(
-        match text
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-        {
-            Ok(ip) => crate::vless::Address::Ip(ip.to_canonical()),
-            Err(_) => crate::vless::Address::Domain(text.to_owned()),
-        },
-    )
+    let text = v.as_str().with_context(|| format!("{path} is not set"))?;
+    let expanded = text.strip_prefix("env:").map(|name| {
+        std::env::var(name)
+            .or_else(|_| std::env::var(name.trim().to_uppercase().replace('.', "_")))
+            .unwrap_or_default()
+    });
+    let text = expanded.as_deref().unwrap_or(text);
+    let text = text
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(text)
+        .trim();
+    Ok(match text.parse::<IpAddr>() {
+        Ok(ip) => crate::vless::Address::Ip(ip.to_canonical()),
+        Err(_) => crate::vless::Address::Domain(text.to_owned()),
+    })
 }
 
 /// VLessOutboundConfig.Build (one vnext, one user) plus its stream settings.
@@ -492,28 +494,7 @@ fn parse_vless_outbound(
         );
     }
     let ws = matches!(stream["network"].as_str(), Some("ws" | "websocket"));
-    let security = match stream["security"].as_str().unwrap_or("none") {
-        "none" | "" => crate::vless_out::Security::None,
-        "tls" => crate::vless_out::Security::Tls(parse_tls_client(
-            &stream["tlsSettings"],
-            &format!("{sp}.tlsSettings"),
-            &default_name,
-            ws,
-        )?),
-        "reality" => {
-            ensure!(
-                !ws,
-                "{}",
-                unsupported(&format!("{sp}: REALITY over WebSocket"))
-            );
-            crate::vless_out::Security::Reality(parse_reality_client(
-                &stream["realitySettings"],
-                &format!("{sp}.realitySettings"),
-                &default_name,
-            )?)
-        }
-        other => return Err(unsupported(&format!("{sp}.security {other}"))),
-    };
+    let security = parse_outbound_security(stream, &sp, &default_name, ws)?;
     let network = match stream["network"].as_str().unwrap_or("raw") {
         "raw" | "tcp" | "" => crate::vless_out::Network::Raw,
         "xhttp" | "splithttp" => {
@@ -579,6 +560,159 @@ fn parse_vless_outbound(
         level,
         network,
         security,
+    })
+}
+
+fn parse_outbound_socket(sockopt: &Value, sp: &str) -> Result<crate::socket::Options> {
+    keys(sockopt, &["interface", "tcpFastOpen", "penetrate"], sp)?;
+    let interface = match &sockopt["interface"] {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        _ => bail!("{sp}.interface must be a string"),
+    };
+    ensure!(
+        !interface.contains('\0') && interface.len() < 16,
+        "{sp}.interface must be shorter than 16 bytes without NUL"
+    );
+    let tcp_fast_open = match &sockopt["tcpFastOpen"] {
+        Value::Null => None,
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|i| if i < 0 { None } else { Some(i > 0) })
+            .with_context(|| format!("{sp}.tcpFastOpen must be an integer"))?,
+        _ => bail!("{sp}.tcpFastOpen must be a boolean or integer"),
+    };
+    ensure!(
+        sockopt["penetrate"].is_null() || sockopt["penetrate"].is_boolean(),
+        "{sp}.penetrate must be a boolean"
+    );
+    Ok(crate::socket::Options {
+        interface,
+        tcp_fast_open,
+        penetrate: sockopt["penetrate"] == true,
+    })
+}
+
+fn parse_outbound_security(
+    stream: &Value,
+    sp: &str,
+    default_name: &str,
+    ws: bool,
+) -> Result<crate::vless_out::Security> {
+    Ok(
+        match stream["security"]
+            .as_str()
+            .unwrap_or("none")
+            .to_lowercase()
+            .as_str()
+        {
+            "none" | "" => crate::vless_out::Security::None,
+            "tls" => crate::vless_out::Security::Tls(parse_tls_client(
+                &stream["tlsSettings"],
+                &format!("{sp}.tlsSettings"),
+                default_name,
+                ws,
+            )?),
+            "reality" => {
+                ensure!(
+                    !ws,
+                    "{}",
+                    unsupported(&format!("{sp}: REALITY over WebSocket"))
+                );
+                crate::vless_out::Security::Reality(parse_reality_client(
+                    &stream["realitySettings"],
+                    &format!("{sp}.realitySettings"),
+                    default_name,
+                )?)
+            }
+            other => return Err(unsupported(&format!("{sp}.security {other}"))),
+        },
+    )
+}
+
+pub(crate) fn parse_xhttp_download(
+    stream: &Value,
+    path: &str,
+) -> Result<crate::xhttp_client::Download> {
+    let fields = [
+        "address",
+        "port",
+        "method",
+        "network",
+        "security",
+        "tlsSettings",
+        "realitySettings",
+        "xhttpSettings",
+        "splithttpSettings",
+        "sockopt",
+    ];
+    let mut normalized = serde_json::Map::new();
+    for (key, value) in stream.as_object().into_iter().flatten() {
+        let name = fields
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(key))
+            .copied()
+            .unwrap_or(key.as_str());
+        if name == key || !normalized.contains_key(name) {
+            normalized.insert(name.to_owned(), value.clone());
+        }
+    }
+    ensure!(stream.is_object(), "{path} must be an object");
+    let stream = &Value::Object(normalized);
+    keys(stream, &fields, path)?;
+    for field in ["method", "network", "security"] {
+        ensure!(
+            stream[field].is_null() || stream[field].is_string(),
+            "{path}.{field} must be a string"
+        );
+    }
+    let protocol = if stream["method"].is_null() {
+        &stream["network"]
+    } else {
+        &stream["method"]
+    };
+    let network = protocol.as_str().unwrap_or("tcp").to_lowercase();
+    ensure!(
+        matches!(network.as_str(), "xhttp" | "splithttp"),
+        "{}",
+        unsupported(&format!(
+            "{path}.network {network} (downloadSettings requires XHTTP)"
+        ))
+    );
+    let address = address(&stream["address"], &format!("{path}.address"))?;
+    let default_name = match &address {
+        crate::vless::Address::Ip(ip) => ip.to_string(),
+        crate::vless::Address::Domain(name) => name.clone(),
+    };
+    let port = match &stream["port"] {
+        Value::Null => 0,
+        value => value
+            .as_u64()
+            .filter(|n| *n <= 65535)
+            .with_context(|| format!("{path}.port must be between 0 and 65535"))?
+            as u16,
+    };
+    let security = parse_outbound_security(stream, path, &default_name, false)?;
+    if let crate::vless_out::Security::Tls(tls) = &security {
+        ensure!(
+            tls.alpn != ["h3"],
+            "{}",
+            unsupported(&format!("{path}: XHTTP over HTTP/3"))
+        );
+    }
+    let key = if stream["xhttpSettings"].is_null() {
+        "splithttpSettings"
+    } else {
+        "xhttpSettings"
+    };
+    let config = crate::xhttp_request::Config::parse(&stream[key], &format!("{path}.{key}"))?;
+    Ok(crate::xhttp_client::Download {
+        address,
+        port,
+        security,
+        socket: parse_outbound_socket(&stream["sockopt"], &format!("{path}.sockopt"))?,
+        client: std::sync::Arc::new(crate::xhttp_client::Client::new(config)),
     })
 }
 
@@ -1255,10 +1389,9 @@ impl Config {
                     } else {
                         "xhttpSettings"
                     };
-                    Transport::Xhttp(std::sync::Arc::new(crate::xhttp::Config::parse(
-                        &stream[key],
-                        &format!("{p}.streamSettings.{key}"),
-                    )?))
+                    let path = format!("{p}.streamSettings.{key}");
+                    let config = crate::xhttp::Config::parse(&stream[key], &path)?;
+                    Transport::Xhttp(std::sync::Arc::new(config))
                 }
                 other => return Err(unsupported(&format!("{p}.streamSettings.network {other}"))),
             };
@@ -1467,29 +1600,7 @@ impl Config {
             }
             let sockopt = &stream["sockopt"];
             let sp = format!("{p}.streamSettings.sockopt");
-            keys(sockopt, &["interface", "tcpFastOpen"], &sp)?;
-            let interface = match &sockopt["interface"] {
-                Value::Null => String::new(),
-                Value::String(s) => s.clone(),
-                _ => bail!("{sp}.interface must be a string"),
-            };
-            ensure!(
-                !interface.contains('\0') && interface.len() < 16,
-                "{sp}.interface must be shorter than 16 bytes without NUL"
-            );
-            let tcp_fast_open = match &sockopt["tcpFastOpen"] {
-                Value::Null => None,
-                Value::Bool(b) => Some(*b),
-                Value::Number(n) => n
-                    .as_i64()
-                    .map(|i| if i < 0 { None } else { Some(i > 0) })
-                    .with_context(|| format!("{sp}.tcpFastOpen must be an integer"))?,
-                _ => bail!("{sp}.tcpFastOpen must be a boolean or integer"),
-            };
-            let socket = crate::socket::Options {
-                interface,
-                tcp_fast_open,
-            };
+            let socket = parse_outbound_socket(sockopt, &sp)?;
             let settings = &v["settings"];
             let kind = match v["protocol"].as_str() {
                 Some("freedom") => {

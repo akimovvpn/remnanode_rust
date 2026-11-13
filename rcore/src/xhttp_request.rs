@@ -5,6 +5,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn accepts_separate_download_stream_settings() {
+        assert!(Config::parse(&json!({"path":"/upload", "downloadSettings":{
+            "address":"127.0.0.1", "port":8443, "network":"xhttp", "security":"tls",
+            "tlsSettings":{"serverName":"download.test"}, "xhttpSettings":{"path":"/download"}
+        }}), "x").is_ok());
+    }
+
+    #[test]
     fn defaults_keep_go_xmux_bundle_and_packet_ranges() {
         let c = Config::parse(&json!({}), "x").unwrap();
         assert_eq!(c.post_size, (1_000_000, 1_000_000));
@@ -167,7 +175,7 @@ pub(crate) struct Xmux {
     pub keep_alive: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Config {
     pub server: crate::xhttp::Config,
     pub query: String,
@@ -176,6 +184,7 @@ pub(crate) struct Config {
     pub post_interval: (i64, i64),
     pub chunk_size: (i64, i64),
     pub xmux: Xmux,
+    pub download: Option<std::sync::Arc<crate::xhttp_client::Download>>,
     headers: HeaderMap,
     no_grpc: bool,
     session_table: Vec<u8>,
@@ -187,12 +196,19 @@ impl Config {
         let server = crate::xhttp::Config::parse(settings, path)?;
         let outer = go_fields(settings);
         let extra = go_fields(&outer["extra"]);
-        let c = if extra.is_null() { &outer } else { &extra };
-        ensure!(
-            c["downloadSettings"].is_null(),
-            "{}",
-            crate::config::unsupported(&format!("{path}.downloadSettings"))
-        );
+        let c = if outer.get("extra").is_none() {
+            &outer
+        } else {
+            &extra
+        };
+        let download = if c["downloadSettings"].is_null() {
+            None
+        } else {
+            Some(std::sync::Arc::new(crate::config::parse_xhttp_download(
+                &c["downloadSettings"],
+                &format!("{path}.downloadSettings"),
+            )?))
+        };
         let normalized = |key: &str, default: (i64, i64)| -> Result<(i64, i64)> {
             let r = range(&c[key], &format!("{path}.{key}"))?;
             Ok(if r.1 == 0 { default } else { r })
@@ -300,6 +316,7 @@ impl Config {
             post_interval,
             chunk_size,
             xmux,
+            download,
             headers,
             no_grpc: c["noGRPCHeader"] == true,
             session_table,

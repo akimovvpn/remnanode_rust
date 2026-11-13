@@ -38,6 +38,14 @@ pub struct Client {
     manager: Mutex<Manager>,
 }
 
+pub(crate) struct Download {
+    pub address: Address,
+    pub port: u16,
+    pub security: Security,
+    pub socket: crate::socket::Options,
+    pub client: Arc<Client>,
+}
+
 struct Manager {
     connections: i64,
     concurrency: i64,
@@ -130,41 +138,15 @@ impl Client {
         server: &Server,
         socket: &crate::socket::Options,
     ) -> Result<BoxIo> {
-        let h2 = match &server.security {
-            Security::None => false,
-            Security::Reality(_) => true,
-            Security::Tls(tls) => {
-                ensure!(tls.alpn != ["h3"], "XHTTP over HTTP/3 is not ported yet");
-                tls.alpn != ["http/1.1"]
-            }
-        };
-        let scheme = if matches!(server.security, Security::None) {
-            "http"
-        } else {
-            "https"
-        };
-        let authority = if !self.config.server.host.is_empty() {
-            self.config.server.host.clone()
-        } else {
-            match &server.security {
-                Security::Tls(tls) | Security::Reality(tls) if !tls.server_name.is_empty() => {
-                    tls.server_name.clone()
-                }
-                _ => server.address.to_string(),
-            }
-        };
-        let dial = Dial {
-            address: server.address.clone(),
-            port: server.port,
-            security: server.security.clone(),
-            socket: socket.clone(),
-            h2,
-        };
-        let mode = match self.config.server.mode.as_str() {
-            "auto" | "" if matches!(server.security, Security::Reality(_)) => "stream-one",
-            "auto" | "" => "packet-up",
-            mode => mode,
-        };
+        let dial = Dial::new(
+            server.address.clone(),
+            server.port,
+            server.security.clone(),
+            socket.clone(),
+        )?;
+        let scheme = dial.scheme();
+        let authority = dial.authority(&self.config);
+        let mode = self.mode(&server.security);
         let session = if mode == "stream-one" {
             String::new()
         } else {
@@ -174,11 +156,44 @@ impl Client {
             "transport/internet/splithttp: XHTTP is dialing to {}:{}, mode {mode}, HTTP version {}, host {authority}",
             server.address,
             server.port,
-            if h2 { "2" } else { "1.1" }
+            if dial.h2 { "2" } else { "1.1" }
         );
+        let (down_client, down_dial) = match &self.config.download {
+            Some(download) => {
+                let socket = if socket.penetrate {
+                    socket
+                } else {
+                    &download.socket
+                };
+                let dial = Dial::new(
+                    download.address.clone(),
+                    download.port,
+                    download.security.clone(),
+                    socket.clone(),
+                )?;
+                tracing::info!(
+                    "transport/internet/splithttp: XHTTP is downloading from {}:{}, mode stream-down, HTTP version {}, host {}",
+                    download.address,
+                    download.port,
+                    if dial.h2 { "2" } else { "1.1" },
+                    dial.authority(&download.client.config)
+                );
+                (&download.client, dial)
+            }
+            None => (self, dial.clone()),
+        };
         let selected = self.select();
+        let selected_down = if Arc::ptr_eq(self, down_client) {
+            selected.clone()
+        } else {
+            down_client.select()
+        };
         selected.running.fetch_add(1, Ordering::AcqRel);
-        let running = Running(selected.clone());
+        let mut running = vec![Running(selected.clone())];
+        if !Arc::ptr_eq(&selected, &selected_down) {
+            selected_down.running.fetch_add(1, Ordering::AcqRel);
+            running.push(Running(selected_down.clone()));
+        }
         let (reader, down) = tokio::io::duplex(BUFFER_SIZE);
         let size = if mode == "packet-up" {
             rand_between(self.config.post_size) as usize
@@ -190,15 +205,15 @@ impl Client {
         let error = Arc::new(Mutex::new(None));
         let clients = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
-        let (request, _) = self.config.request(
-            scheme,
-            &authority,
+        let (request, _) = down_client.config.request(
+            down_dial.scheme(),
+            &down_dial.authority(&down_client.config),
             &session,
             None,
             None,
             mode == "stream-one",
         )?;
-        selected.requests.fetch_sub(1, Ordering::AcqRel);
+        selected_down.requests.fetch_sub(1, Ordering::AcqRel);
         let (stop, stopped) = oneshot::channel();
         let body = if mode == "stream-one" {
             Upload::stream(upload.take().unwrap(), stopped)
@@ -207,15 +222,19 @@ impl Client {
         };
         // OpenStream returns after acquiring the socket, before response headers.
         let (response, active) = waiting(
-            selected
-                .start(&dial, request.map(|_| body), self.config.xmux.keep_alive)
+            selected_down
+                .start(
+                    &down_dial,
+                    request.map(|_| body),
+                    down_client.config.xmux.keep_alive,
+                )
                 .await,
         );
         tasks.push(download(
             response,
             down,
             error.clone(),
-            selected.clone(),
+            selected_down,
             active,
             stop,
         ));
@@ -271,6 +290,20 @@ impl Client {
             _running: running,
             _clients: clients,
         }))
+    }
+
+    fn mode(&self, security: &Security) -> &str {
+        match self.config.server.mode.as_str() {
+            "auto" | "" if matches!(security, Security::Reality(_)) => {
+                if self.config.download.is_some() {
+                    "stream-up"
+                } else {
+                    "stream-one"
+                }
+            }
+            "auto" | "" => "packet-up",
+            mode => mode,
+        }
     }
 
     async fn packets(
@@ -411,6 +444,50 @@ struct Dial {
     h2: bool,
 }
 impl Dial {
+    fn new(
+        address: Address,
+        port: u16,
+        security: Security,
+        socket: crate::socket::Options,
+    ) -> Result<Self> {
+        let h2 = match &security {
+            Security::None => false,
+            Security::Reality(_) => true,
+            Security::Tls(tls) => {
+                ensure!(tls.alpn != ["h3"], "XHTTP over HTTP/3 is not ported yet");
+                tls.alpn != ["http/1.1"]
+            }
+        };
+        Ok(Self {
+            address,
+            port,
+            security,
+            socket,
+            h2,
+        })
+    }
+    fn scheme(&self) -> &'static str {
+        if matches!(self.security, Security::None) {
+            "http"
+        } else {
+            "https"
+        }
+    }
+    fn authority(&self, config: &Config) -> String {
+        if !config.server.host.is_empty() {
+            return config.server.host.clone();
+        }
+        let name = match &self.security {
+            Security::Tls(tls) | Security::Reality(tls) if !tls.server_name.is_empty() => {
+                tls.server_name.clone()
+            }
+            _ => self.address.to_string(),
+        };
+        match name.parse::<std::net::Ipv6Addr>() {
+            Ok(ip) => format!("[{ip}]"),
+            Err(_) => name,
+        }
+    }
     async fn connect(&self) -> Result<BoxIo> {
         let addrs: Vec<_> = match &self.address {
             Address::Ip(ip) => vec![std::net::SocketAddr::new(*ip, self.port)],
@@ -858,7 +935,7 @@ struct Connection {
     writer: DuplexStream,
     error: Arc<Mutex<Option<String>>>,
     tasks: Vec<JoinHandle<()>>,
-    _running: Running,
+    _running: Vec<Running>,
     _clients: Arc<Mutex<Vec<Arc<HttpClient>>>>,
 }
 impl AsyncRead for Connection {
@@ -906,3 +983,7 @@ impl Drop for Connection {
 #[cfg(test)]
 #[path = "xhttp_client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "xhttp_download_tests.rs"]
+mod download_tests;
