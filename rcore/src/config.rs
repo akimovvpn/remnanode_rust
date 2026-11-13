@@ -49,6 +49,53 @@ pub fn string_list(value: &Value, path: &str) -> Result<Vec<String>> {
     }
 }
 
+/// cfgcommon/duration: a JSON string in time.ParseDuration syntax, as nanoseconds.
+pub fn go_duration_ns(value: &Value, path: &str) -> Result<i64> {
+    let text = value
+        .as_str()
+        .with_context(|| format!("{path}: invalid duration: {value}"))?;
+    let (negative, mut rest) = match text.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    ensure!(
+        !rest.is_empty(),
+        "{path}: time: invalid duration \"{text}\""
+    );
+    if rest == "0" {
+        return Ok(0);
+    }
+    let mut total = 0f64;
+    while !rest.is_empty() {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .with_context(|| format!("{path}: time: missing unit in duration \"{text}\""))?;
+        let number: f64 = rest[..end]
+            .parse()
+            .with_context(|| format!("{path}: time: invalid duration \"{text}\""))?;
+        rest = &rest[end..];
+        let unit_end = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let scale = match &rest[..unit_end] {
+            "ns" => 1.0,
+            "us" | "µs" | "μs" => 1e3,
+            "ms" => 1e6,
+            "s" => 1e9,
+            "m" => 60e9,
+            "h" => 3600e9,
+            unit => bail!("{path}: time: unknown unit \"{unit}\" in duration \"{text}\""),
+        };
+        total += number * scale;
+        rest = &rest[unit_end..];
+    }
+    Ok(if negative {
+        -(total as i64)
+    } else {
+        total as i64
+    })
+}
+
 /// Xray PortList: number, "a-b,c" string, or array of those. Returns inclusive ranges.
 pub fn port_list(value: &Value, path: &str) -> Result<Vec<(u16, u16)>> {
     let one = |s: &str| -> Result<(u16, u16)> {
@@ -973,8 +1020,9 @@ pub struct FinalRule {
 pub enum OutboundKind {
     Freedom {
         final_rules: Vec<FinalRule>,
-        strategy: String,
+        strategy: crate::dns::Strategy,
     },
+    Dns(std::sync::Arc<crate::dns_outbound::DnsOutbound>),
     Blackhole {
         http: bool,
     },
@@ -989,6 +1037,10 @@ pub struct Outbound {
 }
 
 pub struct Config {
+    /// Deprecation warnings Go logs while building the config, printed once logging is up.
+    pub warnings: Vec<String>,
+    pub dns: crate::dns::Dns,
+    pub observatory: crate::observatory::Observatory,
     pub stats: bool,
     pub policy: Policy,
     pub inbounds: Vec<Inbound>,
@@ -1072,6 +1124,9 @@ impl Config {
                 "inbounds",
                 "outbounds",
                 "routing",
+                "dns",
+                "observatory",
+                "burstObservatory",
             ],
             "",
         )?;
@@ -1325,6 +1380,7 @@ impl Config {
             });
         }
         let mut outbounds = Vec::new();
+        let mut warnings = Vec::new();
         for (i, v) in root["outbounds"]
             .as_array()
             .into_iter()
@@ -1405,27 +1461,12 @@ impl Config {
                         &["domainStrategy", "finalRules", "userLevel"],
                         &format!("{p}.settings"),
                     )?;
-                    let strategy = settings["domainStrategy"]
-                        .as_str()
-                        .unwrap_or("AsIs")
-                        .to_owned();
-                    ensure!(
-                        matches!(
-                            strategy.as_str(),
-                            "AsIs"
-                                | "UseIP"
-                                | "UseIPv4"
-                                | "UseIPv6"
-                                | "UseIPv4v6"
-                                | "UseIPv6v4"
-                                | "ForceIP"
-                                | "ForceIPv4"
-                                | "ForceIPv6"
-                                | "ForceIPv4v6"
-                                | "ForceIPv6v4"
-                        ),
-                        "{p}.settings.domainStrategy: unknown {strategy}"
-                    );
+                    let name = settings["domainStrategy"].as_str().unwrap_or("AsIs");
+                    let strategy = crate::dns::Strategy::parse(name)
+                        .with_context(|| format!("{p}.settings.domainStrategy: unknown {name}"))?;
+                    if strategy.has_strategy() {
+                        warnings.push("infra/conf: The \"freedom.domainStrategy\" setting is deprecated and will be removed. For compatibility, its value has been automatically migrated to \"sockopt.domainStrategy\". Please update your config before removal.".into());
+                    }
                     let rules = settings["finalRules"]
                         .as_array()
                         .into_iter()
@@ -1486,6 +1527,14 @@ impl Config {
                 Some("vless") => OutboundKind::Vless(std::sync::Arc::new(parse_vless_outbound(
                     settings, stream, &p,
                 )?)),
+                Some("dns") => OutboundKind::Dns(std::sync::Arc::new(
+                    crate::dns_outbound::DnsOutbound::parse(
+                        settings,
+                        &format!("{p}.settings"),
+                        &mut loader,
+                        &mut warnings,
+                    )?,
+                )),
                 Some(other) => return Err(unsupported(&format!("{p}.protocol {other}"))),
                 None => bail!("{p}.protocol is required"),
             };
@@ -1495,7 +1544,21 @@ impl Config {
                 socket,
             });
         }
+        let dns = crate::dns::Dns::parse(&root["dns"], &mut loader)
+            .context("failed to build DNS config")?;
+        let observatory = crate::observatory::Observatory::parse(
+            &root["observatory"],
+            &root["burstObservatory"],
+        )?;
+        // core.RequireFeatures: a balancer that reads observations needs an observatory.
+        ensure!(
+            !router.needs_observatory() || !observatory.is_none(),
+            "core: not all dependencies are resolved."
+        );
         Ok(Self {
+            warnings,
+            dns,
+            observatory,
             stats: !root["stats"].is_null(),
             policy: Policy::parse(&root["policy"])?,
             inbounds,
@@ -1553,7 +1616,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("security tls"), "{error}");
-        assert!(Config::parse(r#"{"dns":{"servers":["1.1.1.1"]}}"#).is_err());
+        assert!(Config::parse(r#"{"dns":{"servers":["1.1.1.1"],"script":"x"}}"#).is_err());
+        assert!(Config::parse(r#"{"dns":{"servers":["fakedns"]}}"#).is_err());
         assert!(Config::parse(r#"{"outbounds":[{"protocol":"vmess"}]}"#).is_err());
     }
     #[test]

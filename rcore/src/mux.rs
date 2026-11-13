@@ -499,7 +499,7 @@ impl Mux {
         let (network, address, port) = meta.target.clone().context("missing target")?;
         let udp = network == UDP;
         tracing::info!(
-            "[{}] common/mux: received request for {}:{address}:{port}",
+            "{}common/mux: received request for {}:{address}:{port}",
             self.base.id,
             if udp { "udp" } else { "tcp" }
         );
@@ -619,7 +619,7 @@ impl Mux {
                 Some(x) if x.status == Status::Initializing => {
                     // Nearly impossible; the client gets End after its next Keep frame.
                     tracing::warn!(
-                        "[{}] common/mux: XUDP hit {} > conflict",
+                        "{}common/mux: XUDP hit {} > conflict",
                         self.base.id,
                         global_id(&id)
                     );
@@ -642,16 +642,12 @@ impl Mux {
             if let Some(previous) = previous {
                 match previous.up.send(first.take().expect("first packet")).await {
                     Ok(()) => {
-                        tracing::info!(
-                            "[{}] common/mux: XUDP hit {}",
-                            self.base.id,
-                            global_id(&id)
-                        );
+                        tracing::info!("{}common/mux: XUDP hit {}", self.base.id, global_id(&id));
                         link = Some(previous);
                     }
                     Err(mpsc::error::SendError(packet)) => {
                         tracing::info!(
-                            "[{}] common/mux: XUDP hit {} > io: read/write on closed pipe",
+                            "{}common/mux: XUDP hit {} > io: read/write on closed pipe",
                             self.base.id,
                             global_id(&id)
                         );
@@ -674,7 +670,7 @@ impl Mux {
                 if let Some(first) = first {
                     let _ = up.send(first).await;
                 }
-                tracing::info!("[{}] common/mux: XUDP new {}", self.base.id, global_id(&id));
+                tracing::info!("{}common/mux: XUDP new {}", self.base.id, global_id(&id));
                 XudpLink {
                     up,
                     down: Arc::new(AsyncMutex::new(down)),
@@ -758,7 +754,7 @@ impl Mux {
 
 fn log_failure(base: &Base, error: &anyhow::Error) {
     tracing::info!(
-        "[{}] app/proxyman/outbound: failed to process outbound traffic > {error:#}",
+        "{}app/proxyman/outbound: failed to process outbound traffic > {error:#}",
         base.id
     );
 }

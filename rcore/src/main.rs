@@ -3,10 +3,13 @@ mod api;
 mod app;
 mod browser;
 mod config;
+mod dns;
+mod dns_outbound;
 #[cfg(test)]
 mod fuzz;
 mod geodata;
 mod mux;
+mod observatory;
 mod reality;
 mod reality_probe;
 mod reality_profile;
@@ -111,9 +114,10 @@ fn main() -> ExitCode {
                 "none" => "off",
                 _ => "warn",
             };
+            // Only rcore's own lines, as Go logs only Xray's (no hyper/h2 internals).
             let logs = tracing_subscriber::fmt()
                 .with_ansi(false)
-                .with_env_filter(tracing_subscriber::EnvFilter::new(level))
+                .with_env_filter(tracing_subscriber::EnvFilter::new(format!("rcore={level}")))
                 .event_format(GoFormat);
             match parsed.error_log.as_deref().map(|p| {
                 std::fs::OpenOptions::new()

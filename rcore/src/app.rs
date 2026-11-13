@@ -1,6 +1,8 @@
 //! Instance wiring: inbound listeners, dispatcher (sniff + route), outbounds and the relay.
 use crate::{
     config::{Config, FinalRule, InboundKind, LevelPolicy, Outbound, OutboundKind},
+    dns::Strategy,
+    dns_outbound::DnsOutbound,
     geodata::{IpMatcher, private_ips},
     router::Ctx,
     sniff::{Sniff, sniff_tcp},
@@ -36,7 +38,7 @@ const HTTP_403: &[u8] = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nCache-C
 
 /// What every dispatch of one inbound connection shares (session.Inbound plus user stats).
 pub(crate) struct Base {
-    pub index: usize,
+    pub origin: Origin,
     pub peer: SocketAddr,
     pub local: SocketAddr,
     pub email: String,
@@ -47,37 +49,117 @@ pub(crate) struct Base {
     pub user_down: Option<Arc<Counter>>,
     pub mux: bool,
     /// session.ID: shown as "[id]" on every log line of this connection.
-    pub id: u32,
+    pub id: Sid,
+}
+
+/// Where a dispatch comes from: an inbound listener, or the core itself (DNS, observatory).
+pub(crate) enum Origin {
+    Inbound(usize),
+    Internal(Internal),
+}
+
+/// The session context the core sets on its own dispatches (app/dns toDnsContext, tagged dialer).
+pub(crate) struct Internal {
+    /// session.Inbound.Tag
+    pub tag: String,
+    /// session.Content.Protocol
+    pub protocol: &'static str,
+    /// session.Content.SkipDNSResolve
+    pub skip_dns: bool,
+    /// session.SetForcedOutboundTagToContext
+    pub forced: Option<String>,
+    /// log.AccessMessage{From: "DNS", To: ...}
+    pub access: Option<String>,
+    /// session.TrackedConnectionError: where the outbound's failure is reported.
+    pub report: Option<Arc<std::sync::Mutex<Option<String>>>>,
+}
+
+/// session.ID as Go prints it: "[id] " before the message, nothing for the core's own traffic.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Sid(pub u32);
+
+impl std::fmt::Display for Sid {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if self.0 == 0 {
+            Ok(())
+        } else {
+            write!(f, "[{}] ", self.0)
+        }
+    }
 }
 
 /// session.NewID: a random non-zero ID per inbound connection.
-pub(crate) fn session_id() -> u32 {
+pub(crate) fn session_id() -> Sid {
     loop {
         let mut b = [0u8; 4];
         let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b);
         let id = u32::from_le_bytes(b);
         if id != 0 {
-            return id;
+            return Sid(id);
         }
     }
 }
 
 impl Base {
     fn ctx(&self, tag: &str, udp: bool, port: u16) -> Ctx {
+        let internal = match &self.origin {
+            Origin::Internal(internal) => Some(internal),
+            Origin::Inbound(_) => None,
+        };
         Ctx {
             inbound_tag: tag.to_owned(),
-            inbound_name: "vless",
+            inbound_name: if internal.is_some() { "" } else { "vless" },
             udp,
-            source: self.peer,
-            local: self.local,
+            source: internal.is_none().then_some(self.peer),
+            local: internal.is_none().then_some(self.local),
             domain: None,
             ip: None,
             port,
-            protocol: String::new(),
+            protocol: internal.map(|i| i.protocol.to_owned()).unwrap_or_default(),
             user: self.email.clone(),
             level: self.level,
             vless_route: self.vless_route,
+            skip_dns: internal.is_some_and(|i| i.skip_dns),
         }
+    }
+
+    /// A dispatch the core starts on its own: no source, user or sniffing.
+    fn internal(internal: Internal, policy: LevelPolicy) -> Self {
+        let none = SocketAddr::from(([0, 0, 0, 0], 0));
+        Base {
+            origin: Origin::Internal(internal),
+            peer: none,
+            local: none,
+            email: String::new(),
+            level: 0,
+            vless_route: 0,
+            policy,
+            user_up: None,
+            user_down: None,
+            mux: false,
+            id: Sid(0),
+        }
+    }
+}
+
+/// internet.DialSystem with no socket options: resolves a domain with the system resolver.
+pub(crate) async fn dial_system(dest: &Address, port: u16) -> Result<TcpStream> {
+    connect_once(
+        &resolve(dest, port).await?,
+        &crate::socket::Options::default(),
+    )
+    .await
+}
+
+/// Appends one access-log line as log.AccessMessage records it.
+pub(crate) fn write_access(path: &str, line: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = file.write_all(format!("{} {line}\n", crate::log_time()).as_bytes());
     }
 }
 
@@ -180,21 +262,21 @@ impl tonic::transport::server::Connected for Counted<TcpStream> {
 }
 
 /// signal.ActivityTimer: cancels a session after `timeout` without traffic.
-struct Activity {
+pub(crate) struct Activity {
     start: Instant,
     last: AtomicU64,
     timeout: AtomicU64,
 }
 
 impl Activity {
-    fn new(timeout: Duration) -> Self {
+    pub(crate) fn new(timeout: Duration) -> Self {
         Self {
             start: Instant::now(),
             last: AtomicU64::new(0),
             timeout: AtomicU64::new(timeout.as_millis() as u64),
         }
     }
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         self.last
             .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
@@ -203,7 +285,7 @@ impl Activity {
             .store(timeout.as_millis() as u64, Ordering::Relaxed);
         self.touch();
     }
-    async fn expired(&self) {
+    pub(crate) async fn expired(&self) {
         loop {
             let idle = self.start.elapsed().as_millis() as u64 - self.last.load(Ordering::Relaxed);
             let timeout = self.timeout.load(Ordering::Relaxed);
@@ -255,6 +337,10 @@ impl Instance {
                 }
             }
         }
+        for warning in &config.warnings {
+            tracing::warn!("{warning}");
+        }
+        config.dns.log_created();
         Ok(Arc::new(Self {
             stats,
             config,
@@ -270,6 +356,7 @@ impl Instance {
 
     /// Binds every inbound, then serves them until the process exits.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        self.config.observatory.start(self);
         for (index, inbound) in self.config.inbounds.iter().enumerate() {
             let listener = TcpListener::bind((inbound.listen, inbound.port))
                 .await
@@ -307,7 +394,7 @@ impl Instance {
                                 if let Err(error) = me.vless_session(index, stream, peer, id).await
                                 {
                                     tracing::info!(
-                                        "[{id}] app/proxyman/inbound: connection ends > {error:#}"
+                                        "{id}app/proxyman/inbound: connection ends > {error:#}"
                                     );
                                 }
                             });
@@ -324,7 +411,7 @@ impl Instance {
         index: usize,
         stream: TcpStream,
         peer: SocketAddr,
-        id: u32,
+        id: Sid,
     ) -> Result<()> {
         let inbound = &self.config.inbounds[index];
         let local = stream.local_addr()?;
@@ -385,7 +472,7 @@ impl Instance {
         peer: SocketAddr,
         local: SocketAddr,
         direct: Option<crate::tls13::DirectControl>,
-        id: u32,
+        id: Sid,
     ) -> Result<()> {
         let inbound = &self.config.inbounds[index];
         let tag = &inbound.tag;
@@ -414,7 +501,7 @@ impl Instance {
             if n == 0 {
                 return Err(vless::EmptyRequest.into());
             }
-            tracing::info!("[{id}] proxy/vless/inbound: firstLen = {n}");
+            tracing::info!("{id}proxy/vless/inbound: firstLen = {n}");
             first.truncate(n);
             let mut reader = crate::transport::Prefixed {
                 prefix: first,
@@ -444,7 +531,7 @@ impl Instance {
         }
         let user = request.user.clone();
         tracing::info!(
-            "[{id}] proxy/vless/inbound: received request for {}:{}:{}",
+            "{id}proxy/vless/inbound: received request for {}:{}:{}",
             if request.command == Command::Udp {
                 "udp"
             } else {
@@ -466,7 +553,7 @@ impl Instance {
             .then(|| OnlineGuard::new(&self.stats, &email, address_string(peer.ip())));
         let base = Base {
             id,
-            index,
+            origin: Origin::Inbound(index),
             peer,
             local,
             user_up: self.counter(
@@ -520,17 +607,20 @@ impl Instance {
             skip,
             header_pending,
         } = stream;
-        let inbound = &self.config.inbounds[base.index];
+        let (tag, sniffing) = self.origin(base);
         let mut dest = address.clone();
         let mut route_domain = match &dest {
             Address::Domain(d) => Some(d.clone()),
             Address::Ip(_) => None,
         };
-        let mut protocol = String::new();
-        let sniffing = &inbound.sniffing;
+        let mut protocol = base.ctx(tag, udp, port).protocol;
+        let route_only = sniffing.is_some_and(|s| s.route_only);
         // Go counts user uplink when the dispatcher reads the client; sniffing reads the first payload.
-        let sniffed = sniffing.enabled && !sniffing.metadata_only && !udp;
-        if sniffed && let Some((p, domain)) = sniff_first(&mut conn, &mut payload).await {
+        let sniffed = sniffing.is_some_and(|s| s.enabled && !s.metadata_only) && !udp;
+        if sniffed
+            && let Some(sniffing) = sniffing
+            && let Some((p, domain)) = sniff_first(&mut conn, &mut payload).await
+        {
             protocol = p.to_owned();
             let overrides = !domain.is_empty()
                 && !sniffing.domains_excluded.matches(&domain)
@@ -539,7 +629,7 @@ impl Instance {
                     .iter()
                     .any(|o| p.starts_with(o.as_str()) || o.starts_with(p));
             if overrides {
-                tracing::info!("[{}] app/dispatcher: sniffed domain: {domain}", base.id);
+                tracing::info!("{}app/dispatcher: sniffed domain: {domain}", base.id);
                 route_domain = Some(domain.clone());
                 if !sniffing.route_only {
                     dest = Address::Domain(domain);
@@ -551,15 +641,15 @@ impl Instance {
             ip: match &dest {
                 Address::Ip(ip) => Some(*ip),
                 Address::Domain(_) => match &address {
-                    Address::Ip(ip) if sniffing.route_only => Some(*ip),
+                    Address::Ip(ip) if route_only => Some(*ip),
                     _ => None,
                 },
             },
             protocol,
-            ..base.ctx(&inbound.tag, udp, port)
+            ..base.ctx(tag, udp, port)
         };
         let destination = format!("{}:{dest}:{port}", if ctx.udp { "udp" } else { "tcp" });
-        let Some((outbound, routed)) = self.route(&ctx, base.id, &destination).await? else {
+        let Some((outbound, routed)) = self.route(&ctx, base, &destination).await? else {
             return Ok(());
         };
         self.access(base, &ctx, &dest, &outbound.tag, routed);
@@ -611,17 +701,22 @@ impl Instance {
                 final_rules,
                 strategy,
             } => {
-                let target = freedom_target(&dest, port, udp, final_rules, strategy).await;
+                let target = self
+                    .freedom_target(&dest, port, udp, final_rules, *strategy, base.id)
+                    .await?;
                 match target {
                     Target::Blocked(rule_delay, shown) => {
                         let delay = block_delay(rule_delay, &shown, udp, base.id);
                         client.drain_for(delay).await
                     }
-                    Target::Dial(addrs) if udp => {
+                    Target::Dial(addrs, resolved) if udp => {
+                        let addrs = self
+                            .dial_addrs(&dest, port, addrs, resolved, "udp", base.id)
+                            .await?;
                         let addr = *addrs.first().context("failed to resolve destination")?;
                         let socket = udp_connect(addr, &outbound.socket).await?;
                         tracing::info!(
-                            "[{}] proxy/freedom: connection opened to udp:{dest}:{port}, local endpoint {}, remote endpoint {addr}",
+                            "{}proxy/freedom: connection opened to udp:{dest}:{port}, local endpoint {}, remote endpoint {addr}",
                             base.id,
                             socket.local_addr()?
                         );
@@ -637,11 +732,14 @@ impl Instance {
                             )
                             .await
                     }
-                    Target::Dial(addrs) => {
+                    Target::Dial(addrs, resolved) => {
                         tracing::info!(
-                            "[{}] transport/internet/tcp: dialing TCP to tcp:{dest}:{port}",
+                            "{}transport/internet/tcp: dialing TCP to tcp:{dest}:{port}",
                             base.id
                         );
+                        let addrs = self
+                            .dial_addrs(&dest, port, addrs, resolved, "tcp", base.id)
+                            .await?;
                         let remote = connect(&addrs, &outbound.socket).await?;
                         if let Address::Domain(_) = dest
                             && let Some((delay, shown)) =
@@ -652,7 +750,7 @@ impl Instance {
                             return client.drain_for(delay).await;
                         }
                         tracing::info!(
-                            "[{}] proxy/freedom: connection opened to tcp:{dest}:{port}, local endpoint {}, remote endpoint {}",
+                            "{}proxy/freedom: connection opened to tcp:{dest}:{port}, local endpoint {}, remote endpoint {}",
                             base.id,
                             remote.local_addr()?,
                             remote.peer_addr()?
@@ -664,13 +762,19 @@ impl Instance {
                     }
                 }
             }
+            OutboundKind::Dns(dns) => {
+                let own = self.config.dns.is_own_link(&ctx.inbound_tag);
+                client
+                    .dns(self, outbound, dns, base.id, own, udp, &dest, port)
+                    .await
+            }
             OutboundKind::Vless(server) => {
                 // The VLESS outbound runs on its own user's policy.
                 let policy = self.config.policy.level(server.level);
                 let counters = (out_up, out_down);
                 if udp {
                     tracing::info!(
-                        "[{}] proxy/vless/outbound: tunneling request to udp:{dest}:{port} via {}:{}",
+                        "{}proxy/vless/outbound: tunneling request to udp:{dest}:{port} via {}:{}",
                         base.id,
                         server.address,
                         server.port
@@ -706,7 +810,7 @@ impl Instance {
                     }
                 }
                 tracing::info!(
-                    "[{}] proxy/vless/outbound: tunneling request to tcp:{dest}:{port} via {}:{}",
+                    "{}proxy/vless/outbound: tunneling request to tcp:{dest}:{port} via {}:{}",
                     base.id,
                     server.address,
                     server.port
@@ -730,7 +834,7 @@ impl Instance {
         port: u16,
         link: PacketLink,
     ) -> Result<()> {
-        let tag = &self.config.inbounds[base.index].tag;
+        let (tag, _) = self.origin(base);
         let ctx = Ctx {
             domain: match &dest {
                 Address::Domain(d) => Some(d.clone()),
@@ -743,7 +847,7 @@ impl Instance {
             ..base.ctx(tag, true, port)
         };
         let destination = format!("{}:{dest}:{port}", if ctx.udp { "udp" } else { "tcp" });
-        let Some((outbound, routed)) = self.route(&ctx, base.id, &destination).await? else {
+        let Some((outbound, routed)) = self.route(&ctx, base, &destination).await? else {
             return Ok(());
         };
         self.access(base, &ctx, &dest, &outbound.tag, routed);
@@ -759,23 +863,29 @@ impl Instance {
                 let out = PacketOut::Socks { socket, dest, port };
                 let mut closed = [0u8; 1];
                 tokio::select! {
-                    result = relay_packets(link, out, base, out_up, out_down) => result,
+                    result = relay_packets(self, link, out, base, out_up, out_down) => result,
                     _ = remote.read(&mut closed) => Ok(()),
                 }
             }
             OutboundKind::Freedom {
                 final_rules,
                 strategy,
-            } => match freedom_target(&dest, port, true, final_rules, strategy).await {
+            } => match self
+                .freedom_target(&dest, port, true, final_rules, *strategy, base.id)
+                .await?
+            {
                 Target::Blocked(rule_delay, shown) => {
                     link.drain_for(block_delay(rule_delay, &shown, true, base.id), base)
                         .await
                 }
-                Target::Dial(addrs) => {
+                Target::Dial(addrs, resolved) => {
+                    let addrs = self
+                        .dial_addrs(&dest, port, addrs, resolved, "udp", base.id)
+                        .await?;
                     let default = *addrs.first().context("failed to resolve destination")?;
                     let socket = udp_bind(&outbound.socket).await?;
                     tracing::info!(
-                        "[{}] proxy/freedom: connection opened to udp:{dest}:{port}, local endpoint {}, remote endpoint {default}",
+                        "{}proxy/freedom: connection opened to udp:{dest}:{port}, local endpoint {}, remote endpoint {default}",
                         base.id,
                         socket.local_addr()?
                     );
@@ -785,15 +895,19 @@ impl Instance {
                         default,
                         original: dest,
                         rules: final_rules,
-                        strategy,
+                        strategy: *strategy,
                     };
-                    relay_packets(link, out, base, out_up, out_down).await
+                    relay_packets(self, link, out, base, out_up, out_down).await
                 }
             },
+            OutboundKind::Dns(dns) => {
+                let own = self.config.dns.is_own_link(&ctx.inbound_tag);
+                link.dns(self, outbound, dns, base, own, &dest, port).await
+            }
             OutboundKind::Vless(server) => {
                 let handshake = self.config.policy.level(server.level).handshake;
                 tracing::info!(
-                    "[{}] proxy/vless/outbound: tunneling request to udp:{dest}:{port} via {}:{}",
+                    "{}proxy/vless/outbound: tunneling request to udp:{dest}:{port} via {}:{}",
                     base.id,
                     server.address,
                     server.port
@@ -804,56 +918,137 @@ impl Instance {
                 )
                 .await
                 .context("VLESS outbound handshake timeout")??;
-                relay_packets(link, PacketOut::Vless(tunnel), base, None, None).await
+                relay_packets(self, link, PacketOut::Vless(tunnel), base, None, None).await
             }
         }
     }
 
-    /// The outbound and whether a rule picked it; `None` when a rule names a missing outbound.
-    async fn route(
-        &self,
-        ctx: &Ctx,
-        id: u32,
-        destination: &str,
-    ) -> Result<Option<(&Outbound, bool)>> {
-        let Some(rule) = self.config.router.pick(ctx).await else {
-            tracing::info!("[{id}] app/dispatcher: default route for {destination}");
-            let default = self.config.outbounds.first();
-            return Ok(Some((
-                default.context("default outbound handler not exist")?,
-                false,
-            )));
-        };
-        match self
-            .config
-            .outbounds
-            .iter()
-            .find(|o| o.tag == rule.outbound)
-        {
-            Some(o) => {
-                if rule.tag.is_empty() {
-                    tracing::info!(
-                        "[{id}] app/dispatcher: taking detour [{}] for [{destination}]",
-                        o.tag
-                    );
-                } else {
-                    tracing::info!(
-                        "[{id}] app/dispatcher: Hit route rule: [{}] so taking detour [{}] for [{destination}]",
-                        rule.tag,
-                        o.tag
-                    );
-                }
-                Ok(Some((o, true)))
-            }
-            None => {
-                // DO NOT CHANGE (Go): a missing tag must not fall back to the default outbound.
-                tracing::warn!(
-                    "[{id}] app/dispatcher: non existing outTag: {}",
-                    rule.outbound
+    /// The inbound tag and sniffing settings of a dispatch (none for the core's own traffic).
+    fn origin<'a>(&'a self, base: &'a Base) -> (&'a str, Option<&'a crate::config::Sniffing>) {
+        match &base.origin {
+            Origin::Inbound(i) => (
+                &self.config.inbounds[*i].tag,
+                Some(&self.config.inbounds[*i].sniffing),
+            ),
+            Origin::Internal(internal) => (&internal.tag, None),
+        }
+    }
+
+    /// The core's own byte stream through routing and an outbound (cnc over a dispatched link).
+    pub(crate) fn dial_internal(
+        self: &Arc<Self>,
+        internal: Internal,
+        dest: Address,
+        port: u16,
+    ) -> BoxIo {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let me = self.clone();
+        let report = internal.report.clone();
+        tokio::spawn(async move {
+            let base = Base::internal(internal, me.config.policy.level(0));
+            let stream = Stream {
+                conn: Counted::new(Box::new(theirs) as BoxIo, None, None),
+                payload: Vec::new(),
+                skip: Arc::default(),
+                header_pending: false,
+            };
+            if let Err(error) = me.dispatch_stream(&base, stream, false, dest, port).await {
+                let error = format!(
+                    "app/proxyman/outbound: failed to process outbound traffic > {error:#}"
                 );
-                Ok(None)
+                if let Some(report) = report {
+                    *report.lock().unwrap() = Some(error.clone());
+                }
+                tracing::info!("{error}");
+            }
+        });
+        Box::new(ours)
+    }
+
+    /// The core's own packet link through routing and an outbound (udp.Dispatcher's link).
+    pub(crate) fn packets_internal(
+        self: &Arc<Self>,
+        internal: Internal,
+        dest: Address,
+        port: u16,
+    ) -> (mpsc::Sender<Packet>, mpsc::Receiver<Packet>) {
+        let (up_tx, up) = mpsc::channel(64);
+        let (down, down_rx) = mpsc::channel(64);
+        let me = self.clone();
+        tokio::spawn(async move {
+            let base = Base::internal(internal, me.config.policy.level(0));
+            let link = PacketLink { up, down };
+            if let Err(error) = me.dispatch_packets(&base, dest, port, link).await {
+                tracing::info!(
+                    "app/proxyman/outbound: failed to process outbound traffic > {error:#}"
+                );
+            }
+        });
+        (up_tx, down_rx)
+    }
+
+    /// routedDispatch: the outbound and how it was chosen; `None` when the chosen tag is missing.
+    async fn route(
+        self: &Arc<Self>,
+        ctx: &Ctx,
+        base: &Base,
+        destination: &str,
+    ) -> Result<Option<(&Outbound, Detour)>> {
+        let id = base.id;
+        let find = |tag: &str| self.config.outbounds.iter().find(|o| o.tag == tag);
+        if let Origin::Internal(Internal {
+            forced: Some(tag), ..
+        }) = &base.origin
+        {
+            return Ok(match find(tag) {
+                Some(o) => {
+                    tracing::info!(
+                        "{id}app/dispatcher: taking platform initialized detour [{tag}] for [{destination}]"
+                    );
+                    Some((o, Detour::Forced))
+                }
+                None => {
+                    tracing::error!(
+                        "{id}app/dispatcher: non existing tag for platform initialized detour: {tag}"
+                    );
+                    None
+                }
+            });
+        }
+        match self.config.router.pick(ctx, self).await {
+            Ok(Some((rule, tag))) => match find(&tag) {
+                Some(o) => {
+                    if rule.tag.is_empty() {
+                        tracing::info!(
+                            "{id}app/dispatcher: taking detour [{tag}] for [{destination}]"
+                        );
+                    } else {
+                        tracing::info!(
+                            "{id}app/dispatcher: Hit route rule: [{}] so taking detour [{tag}] for [{destination}]",
+                            rule.tag
+                        );
+                    }
+                    return Ok(Some((o, Detour::Rule)));
+                }
+                None => {
+                    // DO NOT CHANGE (Go): a missing tag must not fall back to the default outbound.
+                    tracing::warn!("{id}app/dispatcher: non existing outTag: {tag}");
+                    return Ok(None);
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    "{id}app/dispatcher: failed to pick route for {destination} > {error:#}"
+                );
             }
         }
+        tracing::info!("{id}app/dispatcher: default route for {destination}");
+        let default = self.config.outbounds.first();
+        Ok(Some((
+            default.context("default outbound handler not exist")?,
+            Detour::Default,
+        )))
     }
 
     fn outbound_counters(&self, tag: &str) -> (Option<Arc<Counter>>, Option<Arc<Counter>>) {
@@ -870,38 +1065,50 @@ impl Instance {
     }
 
     /// log.AccessMessage as the dispatcher records it.
-    fn access(&self, base: &Base, ctx: &Ctx, dest: &Address, outbound: &str, routed: bool) {
+    fn access(&self, base: &Base, ctx: &Ctx, dest: &Address, outbound: &str, detour: Detour) {
         let Some(path) = &self.config.access_log else {
             return;
         };
-        let mut line = format!(
-            "from {}{} accepted {}:{dest}:{}",
-            // Mux sub-sessions log the inbound source as a net.Destination.
-            if base.mux { "tcp:" } else { "" },
-            ctx.source,
-            if ctx.udp { "udp" } else { "tcp" },
-            ctx.port,
-        );
+        let mut line = match (&base.origin, ctx.source) {
+            (
+                Origin::Internal(Internal {
+                    access: Some(to), ..
+                }),
+                _,
+            ) => {
+                format!("from DNS accepted {to}")
+            }
+            // Only the DNS module puts an access message in its context.
+            (Origin::Internal(_), _) | (_, None) => return,
+            (Origin::Inbound(_), Some(source)) => format!(
+                "from {}{source} accepted {}:{dest}:{}",
+                // Mux sub-sessions log the inbound source as a net.Destination.
+                if base.mux { "tcp:" } else { "" },
+                if ctx.udp { "udp" } else { "tcp" },
+                ctx.port,
+            ),
+        };
         let inbound = &ctx.inbound_tag;
-        match (inbound.is_empty(), outbound.is_empty()) {
-            (_, true) => {}
-            (true, false) => line += &format!(" [{outbound}]"),
-            (false, false) if routed => line += &format!(" [{inbound} -> {outbound}]"),
-            (false, false) => line += &format!(" [{inbound} >> {outbound}]"),
+        match (inbound.is_empty(), outbound.is_empty(), detour) {
+            (_, true, _) => {}
+            (true, false, _) => line += &format!(" [{outbound}]"),
+            (false, false, Detour::Forced) => line += &format!(" [{inbound} ==> {outbound}]"),
+            (false, false, Detour::Rule) => line += &format!(" [{inbound} -> {outbound}]"),
+            (false, false, Detour::Default) => line += &format!(" [{inbound} >> {outbound}]"),
         }
         if !ctx.user.is_empty() {
             line += &format!(" email: {}", ctx.user);
         }
-        line.push('\n');
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            use std::io::Write;
-            let _ = file.write_all(format!("{} {line}", crate::log_time()).as_bytes());
-        }
+        write_access(path, &line);
     }
+}
+
+/// How routedDispatch chose the outbound (isPickRoute).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Detour {
+    Default,
+    Forced,
+    Rule,
 }
 
 fn async_incoming(
@@ -958,8 +1165,17 @@ async fn sniff_first<S: AsyncRead + Unpin>(
 }
 
 enum Target {
-    Dial(Vec<SocketAddr>),
+    /// Addresses to dial, and what DialSystem logs about the domain strategy first.
+    Dial(Vec<SocketAddr>, Resolved),
     Blocked((u64, u64), String),
+}
+
+/// How DialSystem treats a domain target: dial what was resolved, or resolve again through the
+/// DNS module with sockopt.domainStrategy (freedom.domainStrategy) and dial one random IP.
+#[derive(Clone, Copy)]
+enum Resolved {
+    Plain,
+    Strategy(Strategy),
 }
 
 fn rule_matches(rule: &FinalRule, ip: IpAddr, port: u16, udp: bool) -> bool {
@@ -981,77 +1197,148 @@ fn blocked(addr: SocketAddr, udp: bool, rules: &[FinalRule]) -> Option<((u64, u6
         .then(|| ((30, 90), addr.to_string()))
 }
 
-fn block_delay((min, max): (u64, u64), shown: &str, udp: bool, id: u32) -> Duration {
+fn block_delay((min, max): (u64, u64), shown: &str, udp: bool, id: Sid) -> Duration {
     let delay = min + rand_below(max.saturating_sub(min) + 1);
     // FinalRule.log defaults to Info.
     tracing::info!(
-        "[{id}] proxy/freedom: target blocked by a finalrule: {}:{shown}, blackholing connection for {delay}s",
+        "{id}proxy/freedom: target blocked by a finalrule: {}:{shown}, blackholing connection for {delay}s",
         if udp { "udp" } else { "tcp" }
     );
     Duration::from_secs(delay)
 }
 
-async fn freedom_target(
-    dest: &Address,
-    port: u16,
-    udp: bool,
-    rules: &[FinalRule],
-    strategy: &str,
-) -> Target {
-    let addrs: Vec<SocketAddr> = match dest {
-        Address::Ip(ip) => vec![SocketAddr::new(*ip, port)],
-        Address::Domain(d) => tokio::net::lookup_host((d.as_str(), port))
+impl Instance {
+    /// freedom Process before dialing: final rules over the resolved IPs, with
+    /// sockopt.domainStrategy (freedom.domainStrategy) resolving through the DNS module.
+    async fn freedom_target(
+        self: &Arc<Self>,
+        dest: &Address,
+        port: u16,
+        udp: bool,
+        rules: &[FinalRule],
+        strategy: Strategy,
+        id: Sid,
+    ) -> Result<Target> {
+        let domain = match dest {
+            Address::Ip(ip) => {
+                let addr = SocketAddr::new(*ip, port);
+                return Ok(match blocked(addr, udp, rules) {
+                    Some((delay, shown)) => Target::Blocked(delay, shown),
+                    None => Target::Dial(vec![addr], Resolved::Plain),
+                });
+            }
+            Address::Domain(domain) => domain,
+        };
+        let system = async || -> Vec<SocketAddr> {
+            match tokio::net::lookup_host((domain.as_str(), port)).await {
+                Ok(addrs) => addrs.collect(),
+                Err(error) => {
+                    tracing::info!(
+                        "{id}proxy/freedom: failed to get IP address for domain {domain} > {error}"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        if !strategy.has_strategy() {
+            let addrs = system().await;
+            for addr in &addrs {
+                if let Some((delay, shown)) = blocked(*addr, udp, rules) {
+                    return Ok(Target::Blocked(delay, shown));
+                }
+            }
+            return Ok(Target::Dial(addrs, Resolved::Plain));
+        }
+        // retry.ExponentialBackoff(5, 100) around the lookup, as Go retries a ForceIP failure.
+        let mut last = None;
+        for attempt in 0..5u64 {
+            match self.config.dns.lookup_for_ip(self, domain, strategy).await {
+                Ok(ips) => {
+                    for ip in &ips {
+                        if let Some((delay, shown)) =
+                            blocked(SocketAddr::new(*ip, port), udp, rules)
+                        {
+                            return Ok(Target::Blocked(delay, shown));
+                        }
+                    }
+                    return Ok(Target::Dial(Vec::new(), Resolved::Strategy(strategy)));
+                }
+                Err(error) => {
+                    tracing::info!(
+                        "{id}proxy/freedom: failed to get IP address for domain {domain} > {error}"
+                    );
+                    if !strategy.force() {
+                        return Ok(Target::Dial(Vec::new(), Resolved::Strategy(strategy)));
+                    }
+                    last = Some(error);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+        }
+        bail!(
+            "proxy/freedom: failed to open connection to {}:{dest}:{port} > {}",
+            if udp { "udp" } else { "tcp" },
+            last.map(|e| e.to_string()).unwrap_or_default()
+        )
+    }
+
+    /// DialSystem: with a domain strategy, a random IP from the DNS module ("replace
+    /// destination"), falling back to the system resolver unless the strategy forces IPs.
+    async fn dial_addrs(
+        self: &Arc<Self>,
+        dest: &Address,
+        port: u16,
+        addrs: Vec<SocketAddr>,
+        resolved: Resolved,
+        net: &str,
+        id: Sid,
+    ) -> Result<Vec<SocketAddr>> {
+        let (Resolved::Strategy(strategy), Address::Domain(domain)) = (resolved, dest) else {
+            tracing::debug!("{id}transport/internet: dialing to {net}:{dest}:{port}");
+            return Ok(addrs);
+        };
+        match self.config.dns.lookup_for_ip(self, domain, strategy).await {
+            Ok(ips) => {
+                let addr = SocketAddr::new(ips[crate::dns::roll(ips.len())], port);
+                tracing::info!("{id}transport/internet: replace destination with {net}:{addr}");
+                tracing::debug!("{id}transport/internet: dialing to {net}:{addr}");
+                Ok(vec![addr])
+            }
+            Err(error) => {
+                tracing::error!("{id}transport/internet: failed to resolve ip > {error}");
+                if strategy.force() {
+                    bail!("transport/internet: failed to resolve ip > {error}");
+                }
+                tracing::debug!("{id}transport/internet: dialing to {net}:{dest}:{port}");
+                Ok(resolve(dest, port).await.unwrap_or_default())
+            }
+        }
+    }
+
+    /// freedom PacketWriter resolution of a per-packet domain: a random IP from the domain
+    /// strategy (ForceIP* drops the packet without one), else the system resolver's IPv4 first.
+    async fn resolve_packet(
+        self: &Arc<Self>,
+        domain: &str,
+        port: u16,
+        strategy: Strategy,
+    ) -> Option<IpAddr> {
+        if strategy.has_strategy() {
+            match self.config.dns.lookup_for_ip(self, domain, strategy).await {
+                Ok(ips) => return Some(ips[crate::dns::roll(ips.len())]),
+                Err(_) if strategy.force() => return None,
+                Err(_) => {}
+            }
+        }
+        let all: Vec<SocketAddr> = tokio::net::lookup_host((domain, port))
             .await
             .map(|a| a.collect())
-            .unwrap_or_default(),
-    };
-    let addrs = by_strategy(addrs, strategy);
-    for addr in &addrs {
-        if let Some((delay, shown)) = blocked(*addr, udp, rules) {
-            return Target::Blocked(delay, shown);
-        }
+            .unwrap_or_default();
+        all.iter()
+            .find(|a| a.is_ipv4())
+            .or(all.first())
+            .map(SocketAddr::ip)
     }
-    Target::Dial(addrs)
-}
-
-fn by_strategy(addrs: Vec<SocketAddr>, strategy: &str) -> Vec<SocketAddr> {
-    match strategy {
-        s if s.ends_with("IPv4") => addrs.into_iter().filter(SocketAddr::is_ipv4).collect(),
-        s if s.ends_with("IPv6") => addrs.into_iter().filter(SocketAddr::is_ipv6).collect(),
-        s if s.ends_with("IPv6v4") => {
-            let (mut v6, v4): (Vec<_>, Vec<_>) = addrs.into_iter().partition(SocketAddr::is_ipv6);
-            v6.extend(v4);
-            v6
-        }
-        s if s.ends_with("IPv4v6") => {
-            let (mut v4, v6): (Vec<_>, Vec<_>) = addrs.into_iter().partition(SocketAddr::is_ipv4);
-            v4.extend(v6);
-            v4
-        }
-        _ => addrs,
-    }
-}
-
-/// freedom PacketWriter resolution of a per-packet domain: a random IP allowed by the domain
-/// strategy (ForceIP* drops the packet without one), else the system resolver's IPv4 first.
-async fn resolve_packet(domain: &str, port: u16, strategy: &str) -> Option<IpAddr> {
-    let all: Vec<SocketAddr> = tokio::net::lookup_host((domain, port))
-        .await
-        .map(|a| a.collect())
-        .unwrap_or_default();
-    if strategy != "AsIs" {
-        let ips = by_strategy(all.clone(), strategy);
-        if !ips.is_empty() {
-            return Some(ips[rand_below(ips.len() as u64) as usize].ip());
-        }
-        if strategy.starts_with("Force") {
-            return None;
-        }
-    }
-    all.iter()
-        .find(|a| a.is_ipv4())
-        .or(all.first())
-        .map(SocketAddr::ip)
 }
 
 /// Go dials UDP by listening on "udp" with a wildcard address: dual-stack where IPv6 exists
@@ -1110,7 +1397,7 @@ enum PacketOut<'a> {
         default: SocketAddr,
         original: Address,
         rules: &'a [FinalRule],
-        strategy: &'a str,
+        strategy: Strategy,
     },
     Socks {
         socket: UdpSocket,
@@ -1123,7 +1410,12 @@ enum PacketOut<'a> {
 impl PacketOut<'_> {
     /// Sends one packet to its own destination or the session's; returns the bytes counted by
     /// the outbound (0 for packets the final rules or resolution drop).
-    async fn send(&self, packet: Packet, resolved: &mut HashMap<String, IpAddr>) -> Result<usize> {
+    async fn send(
+        &self,
+        inst: &Arc<Instance>,
+        packet: Packet,
+        resolved: &mut HashMap<String, IpAddr>,
+    ) -> Result<usize> {
         match self {
             PacketOut::Freedom {
                 socket,
@@ -1142,7 +1434,8 @@ impl PacketOut<'_> {
                             Address::Domain(domain) => match resolved.get(&domain) {
                                 Some(ip) => *ip,
                                 None => {
-                                    let Some(ip) = resolve_packet(&domain, port, strategy).await
+                                    let Some(ip) =
+                                        inst.resolve_packet(&domain, port, *strategy).await
                                     else {
                                         return Ok(0);
                                     };
@@ -1219,6 +1512,7 @@ impl PacketOut<'_> {
 
 /// Packet relay between a mux UDP sub-session and the outbound (freedom/socks Process for UDP).
 async fn relay_packets(
+    inst: &Arc<Instance>,
     link: PacketLink,
     out: PacketOut<'_>,
     base: &Base,
@@ -1243,7 +1537,7 @@ async fn relay_packets(
             if let Some(c) = &base.user_up {
                 c.add(packet.data.len() as i64);
             }
-            let wire = out.send(packet, &mut resolved).await?;
+            let wire = out.send(inst, packet, &mut resolved).await?;
             if let Some(c) = &out_up {
                 c.add(wire as i64);
             }
@@ -1279,6 +1573,54 @@ async fn relay_packets(
 }
 
 impl PacketLink {
+    /// The dns outbound over mux UDP: each packet is one message; answers carry no address.
+    #[allow(clippy::too_many_arguments)]
+    async fn dns(
+        self,
+        inst: &Arc<Instance>,
+        outbound: &Outbound,
+        cfg: &DnsOutbound,
+        base: &Base,
+        own: bool,
+        dest: &Address,
+        port: u16,
+    ) -> Result<()> {
+        let PacketLink { mut up, down } = self;
+        let (up_tx, up_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (down_tx, mut down_rx) = mpsc::channel::<Vec<u8>>(16);
+        let reader = async {
+            while let Some(packet) = up.recv().await {
+                if let Some(c) = &base.user_up {
+                    c.add(packet.data.len() as i64);
+                }
+                if up_tx.send(packet.data).await.is_err() {
+                    break;
+                }
+            }
+            drop(up_tx);
+            std::future::pending::<Result<()>>().await
+        };
+        let writer = async {
+            while let Some(data) = down_rx.recv().await {
+                if let Some(c) = &base.user_down {
+                    c.add(data.len() as i64);
+                }
+                if down.send(Packet { data, addr: None }).await.is_err() {
+                    bail!("io: read/write on closed pipe");
+                }
+            }
+            std::future::pending::<Result<()>>().await
+        };
+        let handler = crate::dns_outbound::process(
+            inst, outbound, cfg, base.id, own, true, dest, port, up_rx, down_tx,
+        );
+        tokio::select! {
+            result = handler => result,
+            result = reader => result,
+            result = writer => result,
+        }
+    }
+
     /// blackhole for UDP: optional HTTP response, then drain until 30-90 s pass without packets.
     async fn blackhole(mut self, http: bool, base: &Base) -> Result<()> {
         if http {
@@ -1312,14 +1654,17 @@ impl PacketLink {
     }
 }
 
-async fn resolve(dest: &Address, port: u16) -> Result<Vec<SocketAddr>> {
+pub(crate) async fn resolve(dest: &Address, port: u16) -> Result<Vec<SocketAddr>> {
     match dest {
         Address::Ip(ip) => Ok(vec![SocketAddr::new(*ip, port)]),
         Address::Domain(d) => Ok(tokio::net::lookup_host((d.as_str(), port)).await?.collect()),
     }
 }
 
-async fn udp_connect(addr: SocketAddr, options: &crate::socket::Options) -> Result<UdpSocket> {
+pub(crate) async fn udp_connect(
+    addr: SocketAddr,
+    options: &crate::socket::Options,
+) -> Result<UdpSocket> {
     let socket = UdpSocket::bind(if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -1502,6 +1847,87 @@ impl Client {
         Ok(())
     }
 
+    /// The dns outbound over this client: one message per 2-byte length frame both ways
+    /// (DNS over TCP, or VLESS UDP packets).
+    #[allow(clippy::too_many_arguments)]
+    async fn dns(
+        mut self,
+        inst: &Arc<Instance>,
+        outbound: &Outbound,
+        cfg: &DnsOutbound,
+        id: Sid,
+        own: bool,
+        udp: bool,
+        dest: &Address,
+        port: u16,
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        let first = std::mem::take(&mut self.payload);
+        if !self.payload_counted
+            && !udp
+            && let Some(c) = &self.user_up
+        {
+            c.add(first.len() as i64);
+        }
+        let user_up = self.user_up.clone();
+        let (mut client_read, client_write) = tokio::io::split(self.conn);
+        let mut down = Downlink {
+            inner: client_write,
+            skip: self.skip.clone(),
+            user_down: self.user_down.clone(),
+            header_pending: self.header_pending,
+        };
+        let (up_tx, up_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (down_tx, mut down_rx) = mpsc::channel::<Vec<u8>>(16);
+        let reader = async {
+            let mut buf = [0u8; 8192];
+            pending.extend_from_slice(&first);
+            'read: loop {
+                while pending.len() >= 2 {
+                    let len = u16::from_be_bytes([pending[0], pending[1]]) as usize;
+                    if pending.len() < 2 + len {
+                        break;
+                    }
+                    let message: Vec<u8> = pending.drain(..2 + len).skip(2).collect();
+                    // VLESS UDP counts datagrams; DNS over TCP counts the stream, frames included.
+                    if udp && let Some(c) = &user_up {
+                        c.add(message.len() as i64);
+                    }
+                    if up_tx.send(message).await.is_err() {
+                        break 'read;
+                    }
+                }
+                let n = client_read.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                if !udp && let Some(c) = &user_up {
+                    c.add(n as i64);
+                }
+                pending.extend_from_slice(&buf[..n]);
+            }
+            drop(up_tx);
+            std::future::pending::<Result<()>>().await
+        };
+        let writer = async {
+            while let Some(message) = down_rx.recv().await {
+                let mut framed = (message.len() as u16).to_be_bytes().to_vec();
+                framed.extend_from_slice(&message);
+                let counted = if udp { message.len() } else { framed.len() };
+                down.write_raw(&framed, counted).await?;
+            }
+            std::future::pending::<Result<()>>().await
+        };
+        let handler = crate::dns_outbound::process(
+            inst, outbound, cfg, id, own, udp, dest, port, up_rx, down_tx,
+        );
+        tokio::select! {
+            result = handler => result,
+            result = reader => result,
+            result = writer => result,
+        }
+    }
+
     async fn relay_tcp<R: AsyncRead + AsyncWrite + Unpin>(
         mut self,
         remote: R,
@@ -1681,7 +2107,7 @@ mod continuation_tests {
         drop(remote);
         assert!(
             me.clone()
-                .vless_conn(0, Box::new(io), peer, peer, None, 1)
+                .vless_conn(0, Box::new(io), peer, peer, None, Sid(1))
                 .await
                 .is_ok()
         );
@@ -1689,7 +2115,7 @@ mod continuation_tests {
         remote.write_all(&[0]).await.unwrap();
         drop(remote);
         assert!(
-            me.vless_conn(0, Box::new(io), peer, peer, None, 1)
+            me.vless_conn(0, Box::new(io), peer, peer, None, Sid(1))
                 .await
                 .is_err()
         );
@@ -1717,7 +2143,7 @@ mod continuation_tests {
         let peer = "127.0.0.1:12346".parse().unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(3),
-            me.vless_conn(0, Box::new(io), peer, peer, None, 1),
+            me.vless_conn(0, Box::new(io), peer, peer, None, Sid(1)),
         )
         .await
         .expect("outbound handshake ignored its policy")

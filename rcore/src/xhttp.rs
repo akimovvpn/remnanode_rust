@@ -1135,7 +1135,7 @@ impl Server {
             tokio::select! {
                 result = me.vless_conn(index, conn, remote, local, None, id) => {
                     if let Err(error) = result {
-                        tracing::info!("[{id}] app/proxyman/inbound: connection ends > {error:#}");
+                        tracing::info!("{id}app/proxyman/inbound: connection ends > {error:#}");
                     }
                 }
                 _ = lifetime.closed() => {}

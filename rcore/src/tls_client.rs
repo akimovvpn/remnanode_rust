@@ -24,7 +24,7 @@ use std::{
     sync::{LazyLock, Mutex},
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio::io::AsyncWriteExt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const CCS: &[u8] = &[20, 3, 3, 0, 1, 1];
@@ -390,7 +390,10 @@ static ROOTS: LazyLock<Result<Vec<TrustAnchor<'static>>, String>> =
     LazyLock::new(|| roots().map_err(|e| format!("{e:#}")));
 
 /// Runs the handshake on `tcp` and returns the application stream with its Vision control.
-pub async fn connect(mut tcp: TcpStream, client: &Client) -> Result<(BoxIo, DirectControl)> {
+pub async fn connect<S>(mut tcp: S, client: &Client) -> Result<(BoxIo, DirectControl)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let roots = ROOTS
         .as_ref()
         .map_err(|e| anyhow::anyhow!("TLS roots: {e}"))?;
@@ -751,6 +754,7 @@ async fn spider(io: BoxIo, server_name: String, spider_x: String, y: [i64; 10]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
 
     fn exts(hello: &[u8]) -> Vec<(u16, Vec<u8>)> {
         let mut c = Cursor(&hello[38..]);
