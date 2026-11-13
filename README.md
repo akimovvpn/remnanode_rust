@@ -18,6 +18,18 @@ Firewall plugins and the torrent blocker need Linux, `nft` and `CAP_NET_ADMIN` (
 
 ## Run it
 
+To migrate an existing `/opt/remnanode/docker-compose.yml` to both the Rust node and Rust core:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/akimovvpn/remnanode_rust/main/scripts/use_rust_node.py -o /tmp/use_rust_node.py
+sudo python3 /tmp/use_rust_node.py
+cd /opt/remnanode
+docker compose pull
+docker compose up -d
+```
+
+Then restart the node from the Remnawave panel. The script changes the node image to `ghcr.io/akimovvpn/remnanode_rust:latest` and sets `XRAY_BINARY=/usr/local/bin/rcore`. It requires Python 3 and Docker Compose, validates that only these two settings change, keeps a private timestamped `.bak.*` copy, and preserves the original file's owner/mode and other text. Both block list and map environments are supported; inline/anchored environments, ambiguous node services and local `build` settings are refused without changing the file. Running it again makes no changes. A different Compose path can be passed as its first argument. The script only edits the file; pulling and restarting are the commands above.
+
 It is a drop-in replacement: in the panel's node compose file, change only the image.
 
 ```yaml
