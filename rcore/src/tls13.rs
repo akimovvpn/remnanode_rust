@@ -301,7 +301,11 @@ impl Sizer {
 
 /// Vision switches each direction only after its command frame is consumed or flushed.
 #[derive(Clone, Default)]
-pub struct DirectControl(Arc<AtomicU8>);
+pub struct DirectControl(
+    Arc<AtomicU8>,
+    /// The raw client socket under the TLS layer, for splicing the direct downlink.
+    Arc<std::sync::OnceLock<Arc<tokio::net::TcpStream>>>,
+);
 
 impl DirectControl {
     pub fn read_direct(&self) {
@@ -312,6 +316,16 @@ impl DirectControl {
     }
     fn flags(&self) -> u8 {
         self.0.load(Ordering::Acquire)
+    }
+    pub fn attach(&self, socket: Arc<tokio::net::TcpStream>) {
+        let _ = self.1.set(socket);
+    }
+    /// The client socket once Vision writes directly (inbound.CanSpliceCopy == 1).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn splice_target(&self) -> Option<Arc<tokio::net::TcpStream>> {
+        (self.flags() & 2 != 0)
+            .then(|| self.1.get().cloned())
+            .flatten()
     }
 }
 

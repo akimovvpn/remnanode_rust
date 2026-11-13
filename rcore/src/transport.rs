@@ -376,6 +376,55 @@ pub async fn accept_httpupgrade<S: AsyncRead + AsyncWrite + Unpin + Send + 'stat
     ))
 }
 
+/// One TCP socket shared by a reader, a writer and the splice path (tokio's owned halves keep
+/// their socket private).
+pub struct SharedTcp(pub std::sync::Arc<tokio::net::TcpStream>);
+
+impl AsyncRead for SharedTcp {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskCx<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            std::task::ready!(self.0.poll_read_ready(cx))?;
+            match self.0.try_read(buf.initialize_unfilled()) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SharedTcp {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskCx<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        loop {
+            std::task::ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write(data) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
+            }
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut TaskCx<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskCx<'_>) -> Poll<std::io::Result<()>> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: shutdown(2) on a socket this Arc keeps open; as OwnedWriteHalf does on shutdown.
+        unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_WR) };
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// A stream that first yields already-read bytes.
 pub struct Prefixed<S> {
     pub prefix: Vec<u8>,

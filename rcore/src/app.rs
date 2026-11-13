@@ -169,6 +169,8 @@ pub(crate) struct Stream {
     pub payload: Vec<u8>,
     pub skip: Arc<AtomicUsize>,
     pub header_pending: bool,
+    /// Vision's switch over raw TLS/REALITY, for splicing the direct downlink.
+    pub vision: Option<crate::tls13::DirectControl>,
 }
 
 /// One datagram; `addr` is its destination (uplink) or source (downlink) when it carries one.
@@ -564,13 +566,12 @@ impl Instance {
             Err(error) => return Err(error.context(format!("invalid request from {peer}"))),
         };
         vless::check_flow(&request, outer_tls, &payload)?;
+        let mut vision = None;
         if request.flow == vless::XRV {
-            let (io, decoded) = crate::vision::wrap(
-                conn.inner,
-                &payload,
-                request.sent_id,
-                direct.context("XTLS only supports TLS and REALITY directly for now.")?,
-            )?;
+            let control = direct.context("XTLS only supports TLS and REALITY directly for now.")?;
+            let (io, decoded) =
+                crate::vision::wrap(conn.inner, &payload, request.sent_id, control.clone())?;
+            vision = Some(control);
             conn.inner = io;
             payload = decoded;
         }
@@ -631,6 +632,7 @@ impl Instance {
             payload,
             skip,
             header_pending: true,
+            vision,
         };
         let udp = request.command == Command::Udp;
         self.dispatch_stream(&base, stream, udp, request.address, request.port)
@@ -651,6 +653,7 @@ impl Instance {
             mut payload,
             skip,
             header_pending,
+            vision,
         } = stream;
         let (tag, sniffing) = self.origin(base);
         let mut dest = address.clone();
@@ -711,6 +714,8 @@ impl Instance {
             user_up: base.user_up.clone(),
             user_down: base.user_down.clone(),
             header_pending,
+            vision,
+            id: base.id,
         };
         match &outbound.kind {
             OutboundKind::Blackhole { http } => client.blackhole(*http, udp).await,
@@ -739,7 +744,7 @@ impl Instance {
                             _ = remote.read(&mut closed) => Ok(()),
                         }
                     }
-                    None => client.relay_tcp(remote, policy).await,
+                    None => client.relay_tcp(remote, policy, None).await,
                 }
             }
             OutboundKind::Freedom {
@@ -801,8 +806,14 @@ impl Instance {
                             remote.peer_addr()?
                         );
                         remote.set_nodelay(true).ok();
+                        let remote = Arc::new(remote);
+                        let shared = crate::transport::SharedTcp(remote.clone());
                         client
-                            .relay_tcp(Counted::new(remote, out_down, out_up), policy)
+                            .relay_tcp(
+                                Counted::new(shared, out_down.clone(), out_up),
+                                policy,
+                                Some((remote, out_down)),
+                            )
                             .await
                     }
                 }
@@ -866,7 +877,7 @@ impl Instance {
                 )
                 .await
                 .context("VLESS outbound handshake timeout")??;
-                client.relay_tcp(remote, &policy).await
+                client.relay_tcp(remote, &policy, None).await
             }
         }
     }
@@ -996,6 +1007,7 @@ impl Instance {
                 payload: Vec::new(),
                 skip: Arc::default(),
                 header_pending: false,
+                vision: None,
             };
             if let Err(error) = me.dispatch_stream(&base, stream, false, dest, port).await {
                 let error = format!(
@@ -1831,6 +1843,8 @@ struct Client {
     user_up: Option<Arc<Counter>>,
     user_down: Option<Arc<Counter>>,
     header_pending: bool,
+    vision: Option<crate::tls13::DirectControl>,
+    id: Sid,
 }
 
 pub(crate) const RESPONSE_HEADER: [u8; 2] = [0, 0];
@@ -1973,12 +1987,17 @@ impl Client {
         }
     }
 
+    /// `splice_from`: freedom's socket and outbound downlink counter, for CopyRawConnIfExist.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     async fn relay_tcp<R: AsyncRead + AsyncWrite + Unpin>(
         mut self,
         remote: R,
         policy: &LevelPolicy,
+        splice_from: Option<(Arc<TcpStream>, Option<Arc<Counter>>)>,
     ) -> Result<()> {
         let activity = Activity::new(policy.conn_idle);
+        let inbound_down = self.conn.down.clone();
+        let (vision, id) = (self.vision.take(), self.id);
         let (mut remote_read, mut remote_write) = tokio::io::split(remote);
         let payload = std::mem::take(&mut self.payload);
         let payload_counted = self.payload_counted;
@@ -2017,6 +2036,25 @@ impl Client {
         let downlink = async {
             let mut buf = vec![0u8; 16384];
             loop {
+                // CopyRawConnIfExist: once Vision writes directly (its last padded frame is
+                // flushed), the kernel moves the rest; Go splices only this direction.
+                #[cfg(target_os = "linux")]
+                if let (Some((source, out_down)), Some(target)) = (
+                    &splice_from,
+                    vision.as_ref().and_then(|v| v.splice_target()),
+                ) {
+                    tracing::debug!("{id}proxy: CopyRawConn splice");
+                    activity.set_timeout(Duration::from_secs(24 * 3600));
+                    let (moved, result) = crate::splice::copy(source, &target).await;
+                    for counter in [out_down, &inbound_down, &down.user_down]
+                        .into_iter()
+                        .flatten()
+                    {
+                        counter.add(moved as i64);
+                    }
+                    result?;
+                    break;
+                }
                 let n = remote_read.read(&mut buf).await?;
                 if n == 0 {
                     break;

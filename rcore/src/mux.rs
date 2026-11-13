@@ -720,6 +720,7 @@ impl Mux {
                 payload: Vec::new(),
                 skip: Arc::default(),
                 header_pending: false,
+                vision: None,
             };
             if let Err(error) = me
                 .dispatch_stream(&base, stream, false, address, port)

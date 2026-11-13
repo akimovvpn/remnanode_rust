@@ -958,8 +958,15 @@ impl Server {
         read.seq = secrets.rx.0;
         let mut write = Cipher::new(suite, secret("SERVER_TRAFFIC_SECRET_0")?);
         write.seq = secrets.tx.0;
-        let (reader, writer) = tcp.into_split();
-        let (mut stream, direct) = tls13::stream(reader, writer, read, write, sent);
+        let client = Arc::new(tcp);
+        let (mut stream, direct) = tls13::stream(
+            crate::transport::SharedTcp(client.clone()),
+            crate::transport::SharedTcp(client.clone()),
+            read,
+            write,
+            sent,
+        );
+        direct.attach(client);
         // crypto/tls maxUselessRecords.
         stream.set_max_ignored(16);
         Ok(Accepted {

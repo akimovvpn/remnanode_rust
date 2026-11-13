@@ -535,11 +535,12 @@ pub async fn accept(
             "REALITY: processed invalid connection from {peer}: handshake did not complete successfully"
         ),
     };
-    let (tcp_read, mut tcp_write) = client.into_split();
+    let client = std::sync::Arc::new(client);
+    let mut tcp_write = crate::transport::SharedTcp(client.clone());
     let mut reader = Prefixed {
         prefix: leftover,
         pos: 0,
-        inner: tcp_read,
+        inner: crate::transport::SharedTcp(client.clone()),
     };
     let (read, mut write, mut sent) = tokio::time::timeout(
         policy_timeout,
@@ -563,6 +564,7 @@ pub async fn accept(
     sent += replay_records(&mut tcp_write, &mut write, &profile.records, policy_timeout).await?;
     let (mut stream, direct) = tls13::stream(reader, tcp_write, read, write, sent);
     stream.set_max_ignored(profile.max_ccs);
+    direct.attach(client);
     Ok((Box::new(stream), direct))
 }
 

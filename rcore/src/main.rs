@@ -17,6 +17,8 @@ mod router;
 mod sniff;
 mod socket;
 mod socks;
+#[cfg(target_os = "linux")]
+mod splice;
 mod stats;
 mod tls13;
 mod tls_client;
